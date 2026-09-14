@@ -407,3 +407,20 @@ async fn connection_limit_releases_after_disconnect() {
         200
     );
 }
+
+#[tokio::test]
+async fn metrics_counts_requests_redirects_and_errors() {
+    let addr = start_server().await;
+    roundtrip(addr, &get_request(addr, "/health")).await;
+    let response = roundtrip(addr, &post_request(addr, "https://example.com/m")).await;
+    let code = code_of(&response);
+    roundtrip(addr, &get_request(addr, &format!("/{code}"))).await;
+    roundtrip(addr, &get_request(addr, "/no-such-code")).await;
+    let body = roundtrip(addr, &get_request(addr, "/api/metrics")).await;
+    assert!(body.contains("\"requests\":4"), "got: {body}");
+    assert!(body.contains("\"redirects\":1"), "got: {body}");
+    assert!(body.contains("\"writes\":1"), "got: {body}");
+    assert!(body.contains("\"errors_4xx\":1"), "got: {body}");
+    assert!(body.contains("\"urls\":1"), "got: {body}");
+    assert!(body.contains("access-control-allow-origin: *"), "got: {body}");
+}

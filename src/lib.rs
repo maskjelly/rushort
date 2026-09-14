@@ -1,4 +1,11 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -54,6 +61,7 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub io_timeout: Duration,
     pub max_writes: usize,
+    pub metrics: Arc<Metrics>,
 }
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -63,7 +71,73 @@ impl Default for ServerConfig {
             max_connections: 1024,
             io_timeout: Duration::from_secs(5),
             max_writes: 32,
+            metrics: Arc::new(Metrics::new()),
         }
+    }
+}
+
+/// Lock-free cumulative counters. The dashboard derives RPS/QPS by sampling.
+pub struct Metrics {
+    requests: AtomicU64,
+    redirects: AtomicU64,
+    writes: AtomicU64,
+    errors_4xx: AtomicU64,
+    errors_5xx: AtomicU64,
+    started: std::time::Instant,
+    started_unix: u64,
+}
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl Metrics {
+    pub fn new() -> Self {
+        Self {
+            requests: AtomicU64::new(0),
+            redirects: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            errors_4xx: AtomicU64::new(0),
+            errors_5xx: AtomicU64::new(0),
+            started: std::time::Instant::now(),
+            started_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+    fn record(&self, status: u16) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+        match status {
+            302 => {
+                self.redirects.fetch_add(1, Ordering::Relaxed);
+            }
+            201 => {
+                self.writes.fetch_add(1, Ordering::Relaxed);
+            }
+            400..=499 => {
+                self.errors_4xx.fetch_add(1, Ordering::Relaxed);
+            }
+            500..=599 => {
+                self.errors_5xx.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+    pub fn snapshot(&self, store: &Store) -> String {
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        format!(
+            "{{\"uptime_s\":{},\"started_unix\":{},\"requests\":{},\"redirects\":{},\"writes\":{},\"errors_4xx\":{},\"errors_5xx\":{},\"urls\":{},\"capacity\":{}}}",
+            self.started.elapsed().as_secs(),
+            self.started_unix,
+            load(&self.requests),
+            load(&self.redirects),
+            load(&self.writes),
+            load(&self.errors_4xx),
+            load(&self.errors_5xx),
+            store.len(),
+            store.capacity(),
+        )
     }
 }
 
@@ -82,7 +156,6 @@ pub fn validate_url(url: &str) -> Result<(), &'static str> {
     {
         return Err("url requires a host and must not contain credentials or backslashes");
     }
-    // WHATWG parsing repairs missing slashes/hosts; reject inputs such as https://?x.
     let authority = url
         .split_once("://")
         .unwrap()
@@ -235,7 +308,8 @@ async fn route(
     writes: &Arc<Semaphore>,
     head: &Parsed<'_>,
     body: &[u8],
-) {
+) -> u16 {
+    use std::io::Write;
     let path = head.path.split('?').next().unwrap();
     let close = head.close;
     let method = if head.method == "HEAD" {
@@ -248,10 +322,20 @@ async fn route(
             out.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n");
             connection(out, close);
             out.extend_from_slice(b"ok");
+            200
+        }
+        ("GET", "/api/metrics") => {
+            // Public and CORS-open: powers live dashboards. Counts only, no URLs.
+            let snapshot = config.metrics.snapshot(store);
+            write!(out, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\ncache-control: no-store\r\naccess-control-allow-origin: *\r\n", snapshot.len()).unwrap();
+            connection(out, close);
+            out.extend_from_slice(snapshot.as_bytes());
+            200
         }
         ("GET", "/api/stats") => {
             if !authorized(head.auth, config.write_token.as_deref()) {
-                return error(out, 401, close);
+                error(out, 401, close);
+                return 401;
             }
             json(
                 out,
@@ -264,22 +348,28 @@ async fn route(
                 ),
                 close,
             );
+            200
         }
         ("POST", "/api/shorten") => {
             if !authorized(head.auth, config.write_token.as_deref()) {
-                return error(out, 401, close);
+                error(out, 401, close);
+                return 401;
             }
             let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-                return error(out, 400, close);
+                error(out, 400, close);
+                return 400;
             };
             let Some(url) = value.get("url").and_then(|v| v.as_str()) else {
-                return error(out, 400, close);
+                error(out, 400, close);
+                return 400;
             };
             if validate_url(url).is_err() {
-                return error(out, 400, close);
+                error(out, 400, close);
+                return 400;
             }
             let Ok(permit) = writes.clone().try_acquire_owned() else {
-                return error(out, 503, close);
+                error(out, 503, close);
+                return 503;
             };
             let owned = url.to_owned();
             let store = store.clone();
@@ -289,9 +379,19 @@ async fn route(
             })
             .await;
             match result {
-                Ok(Ok(code)) => json(out,201,&serde_json::json!({"code":code,"short_url":format!("{}/{code}",config.public_base),"long_url":url}).to_string(),close),
-                Ok(Err(e)) if e.kind()==io::ErrorKind::StorageFull => error(out,503,close),
-                _ => { eprintln!("rushort: storage write failed"); error(out,503,close); }
+                Ok(Ok(code)) => {
+                    json(out,201,&serde_json::json!({"code":code,"short_url":format!("{}/{code}",config.public_base),"long_url":url}).to_string(),close);
+                    201
+                }
+                Ok(Err(e)) if e.kind() == io::ErrorKind::StorageFull => {
+                    error(out, 503, close);
+                    503
+                }
+                _ => {
+                    eprintln!("rushort: storage write failed");
+                    error(out, 503, close);
+                    503
+                }
             }
         }
         ("GET", _) => match path.strip_prefix('/').and_then(|code| store.resolve(code)) {
@@ -300,11 +400,21 @@ async fn route(
                 out.extend_from_slice(url.as_bytes());
                 out.extend_from_slice(b"\r\ncontent-length: 0\r\n");
                 connection(out, close);
+                302
             }
-            None => error(out, 404, close),
+            None => {
+                error(out, 404, close);
+                404
+            }
         },
-        ("POST", _) => error(out, 404, close),
-        _ => error(out, 405, close),
+        ("POST", _) => {
+            error(out, 404, close);
+            404
+        }
+        _ => {
+            error(out, 405, close);
+            405
+        }
     }
 }
 fn find_head(buf: &[u8]) -> Option<usize> {
@@ -334,12 +444,14 @@ async fn handle_conn(
             let Some(head_len) = find_head(remaining) else {
                 if remaining.len() >= MAX_HEAD {
                     error(&mut out, 431, true);
+                    cfg.metrics.record(431);
                     close = true;
                 }
                 break;
             };
             if head_len > MAX_HEAD {
                 error(&mut out, 431, true);
+                cfg.metrics.record(431);
                 close = true;
                 break;
             }
@@ -347,6 +459,7 @@ async fn handle_conn(
                 Ok(h) => h,
                 Err(status) => {
                     error(&mut out, status, true);
+                    cfg.metrics.record(status);
                     close = true;
                     break;
                 }
@@ -367,7 +480,7 @@ async fn handle_conn(
                 break;
             }
             let response_start = out.len();
-            route(
+            let status = route(
                 &mut out,
                 &store,
                 &cfg,
@@ -376,6 +489,7 @@ async fn handle_conn(
                 &remaining[head_len..total],
             )
             .await;
+            cfg.metrics.record(status);
             if head.method == "HEAD" {
                 let header_len =
                     find_head(&out[response_start..]).expect("complete response header");
