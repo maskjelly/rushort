@@ -141,6 +141,58 @@ impl Metrics {
     }
 }
 
+/// Live host facts for the dashboard device panel. Linux reads /proc;
+/// other platforms report "n/a" rather than failing.
+pub fn host_snapshot() -> String {
+    fn read(path: &str) -> Option<String> {
+        std::fs::read_to_string(path).ok()
+    }
+    fn field(text: &str, key: &str) -> Option<String> {
+        text.lines().find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            (k.trim() == key).then(|| v.trim().to_owned())
+        })
+    }
+    let empty = String::new();
+    let load = read("/proc/loadavg").unwrap_or(empty.clone());
+    let mut load_parts = load.split_whitespace();
+    let load1: f64 = load_parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let load5: f64 = load_parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let load15: f64 = load_parts.next().unwrap_or("0").parse().unwrap_or(0.0);
+    let meminfo = read("/proc/meminfo").unwrap_or(empty.clone());
+    let kb = |k: &str| {
+        field(&meminfo, k)
+            .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    let cpuinfo = read("/proc/cpuinfo").unwrap_or(empty.clone());
+    let na = || "n/a".to_owned();
+    let hostname = read("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_else(na);
+    let os = read("/etc/os-release")
+        .and_then(|t| field(&t, "PRETTY_NAME"))
+        .unwrap_or_else(na);
+    let cpu = field(&cpuinfo, "model name").unwrap_or_else(na);
+    let cpus = cpuinfo
+        .lines()
+        .filter(|l| l.starts_with("processor"))
+        .count() as u64;
+    let json_escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "{{\"hostname\":\"{}\",\"os\":\"{}\",\"cpu\":\"{}\",\"cpus\":{},\"mem_total_kb\":{},\"mem_available_kb\":{},\"load1\":{:.2},\"load5\":{:.2},\"load15\":{:.2}}}",
+        json_escape(&hostname),
+        json_escape(&os),
+        json_escape(&cpu),
+        cpus,
+        kb("MemTotal"),
+        kb("MemAvailable"),
+        load1,
+        load5,
+        load15,
+    )
+}
+
 pub fn validate_url(url: &str) -> Result<(), &'static str> {
     if url.len() > MAX_URL_LEN || !url.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
         return Err("url must contain 1..2048 printable ASCII bytes");
@@ -327,6 +379,14 @@ async fn route(
         ("GET", "/api/metrics") => {
             // Public and CORS-open: powers live dashboards. Counts only, no URLs.
             let snapshot = config.metrics.snapshot(store);
+            write!(out, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\ncache-control: no-store\r\naccess-control-allow-origin: *\r\n", snapshot.len()).unwrap();
+            connection(out, close);
+            out.extend_from_slice(snapshot.as_bytes());
+            200
+        }
+        ("GET", "/api/host") => {
+            // Public and CORS-open: host facts for the dashboard device panel.
+            let snapshot = host_snapshot();
             write!(out, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\ncache-control: no-store\r\naccess-control-allow-origin: *\r\n", snapshot.len()).unwrap();
             connection(out, close);
             out.extend_from_slice(snapshot.as_bytes());

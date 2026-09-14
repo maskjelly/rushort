@@ -427,3 +427,15 @@ async fn metrics_counts_requests_redirects_and_errors() {
         "got: {body}"
     );
 }
+
+#[tokio::test]
+async fn host_endpoint_reports_facts() {
+    let addr = start_server().await;
+    let body = roundtrip(addr, &get_request(addr, "/api/host")).await;
+    assert!(body.contains("\"cpus\":"), "got: {body}");
+    assert!(body.contains("\"load1\":"), "got: {body}");
+    assert!(
+        body.contains("access-control-allow-origin: *"),
+        "got: {body}"
+    );
+}
