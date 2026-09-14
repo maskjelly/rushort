@@ -1,16 +1,18 @@
-use std::io;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use parking_lot::RwLock;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use std::{io, sync::Arc, time::Duration};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::Semaphore,
+    task::JoinSet,
+    time::{Instant, timeout, timeout_at},
+};
+mod store;
+pub use store::Store;
 
 const ALPHABET: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 const MAX_URL_LEN: usize = 2048;
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_BODY: usize = 8 * 1024;
-const MAX_CODE_LEN: usize = 11;
 const MAX_BATCH: usize = 256;
 
 #[inline]
@@ -45,386 +47,423 @@ pub fn base62_decode(s: &str) -> Option<u64> {
     Some(n)
 }
 
-struct Shard {
-    urls: RwLock<Vec<Arc<str>>>,
+#[derive(Clone)]
+pub struct ServerConfig {
+    pub public_base: String,
+    pub write_token: Option<String>,
+    pub max_connections: usize,
+    pub io_timeout: Duration,
+    pub max_writes: usize,
 }
-
-pub struct Store {
-    shards: Box<[Shard]>,
-    next_write: AtomicU64,
-}
-
-impl Store {
-    pub fn new() -> Self {
-        Self::with_shards(64)
-    }
-
-    pub fn with_shards(n: usize) -> Self {
-        assert!(n.is_power_of_two(), "shard count must be a power of two");
-        let shards = (0..n)
-            .map(|_| Shard {
-                urls: RwLock::new(Vec::with_capacity(1024)),
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        Self {
-            shards,
-            next_write: AtomicU64::new(0),
-        }
-    }
-
-    pub fn shorten(&self, url: &str) -> String {
-        let ticket = self.next_write.fetch_add(1, Ordering::Relaxed);
-        let shard_idx = (ticket as usize) & (self.shards.len() - 1);
-        let shard = &self.shards[shard_idx];
-        let mut urls = shard.urls.write();
-        let index = urls.len() as u64;
-        let id = shard_idx as u64 + index * self.shards.len() as u64;
-        urls.push(Arc::from(url));
-        base62_encode(id)
-    }
-
-    pub fn resolve(&self, code: &str) -> Option<Arc<str>> {
-        let id = base62_decode(code)?;
-        let shard_idx = (id % self.shards.len() as u64) as usize;
-        let index = (id / self.shards.len() as u64) as usize;
-        self.shards[shard_idx].urls.read().get(index).cloned()
-    }
-
-    pub fn len(&self) -> usize {
-        self.shards.iter().map(|s| s.urls.read().len()).sum()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn shard_count(&self) -> usize {
-        self.shards.len()
-    }
-}
-
-impl Default for Store {
+impl Default for ServerConfig {
     fn default() -> Self {
-        Self::new()
+        Self {
+            public_base: "http://127.0.0.1:8080".into(),
+            write_token: None,
+            max_connections: 1024,
+            io_timeout: Duration::from_secs(5),
+            max_writes: 32,
+        }
     }
 }
 
 pub fn validate_url(url: &str) -> Result<(), &'static str> {
-    if url.is_empty() {
-        return Err("url is empty");
+    if url.len() > MAX_URL_LEN || !url.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        return Err("url must contain 1..2048 printable ASCII bytes");
     }
-    if url.len() > MAX_URL_LEN {
-        return Err("url exceeds 2048 characters");
-    }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("url must start with http:// or https://");
     }
-    if !url.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
-        return Err("url contains invalid characters");
+    let parsed = url::Url::parse(url).map_err(|_| "invalid URL")?;
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || url.contains('\\')
+    {
+        return Err("url requires a host and must not contain credentials or backslashes");
+    }
+    // WHATWG parsing repairs missing slashes/hosts; reject inputs such as https://?x.
+    let authority = url
+        .split_once("://")
+        .unwrap()
+        .1
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap();
+    if authority.is_empty() {
+        return Err("url requires a host");
     }
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Method {
-    Get,
-    Post,
-    Other,
-}
-
-struct Parsed {
-    method: Method,
-    path: (usize, usize),
-    host: (usize, usize),
+struct Parsed<'a> {
+    method: &'a str,
+    path: &'a str,
     content_length: usize,
     close: bool,
-    expect_continue: bool,
+    expect: bool,
+    auth: &'a [u8],
 }
-
-fn memchr(byte: u8, haystack: &[u8]) -> Option<usize> {
-    haystack.iter().position(|&b| b == byte)
-}
-
-fn parse_usize(bytes: &[u8]) -> Option<usize> {
-    if bytes.is_empty() {
-        return None;
+fn parse_head(head: &[u8]) -> Result<Parsed<'_>, u16> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+    if !req.parse(head).map_err(|_| 400u16)?.is_complete() {
+        return Err(400);
     }
-    let mut n: usize = 0;
-    for &b in bytes {
-        if !b.is_ascii_digit() {
-            return None;
+    let mut length = None;
+    let mut host = None;
+    let mut close = false;
+    let mut keep = false;
+    let mut expect = false;
+    let mut auth = None;
+    for h in req.headers.iter() {
+        let v = h.value.trim_ascii();
+        if h.name.eq_ignore_ascii_case("content-length") {
+            // Reject duplicate fields, including identical ones: no ambiguous framing.
+            if length.is_some() || v.is_empty() || !v.iter().all(u8::is_ascii_digit) {
+                return Err(400);
+            }
+            length = Some(
+                std::str::from_utf8(v)
+                    .map_err(|_| 400u16)?
+                    .parse::<usize>()
+                    .map_err(|_| 400u16)?,
+            );
+        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(400);
+        } else if h.name.eq_ignore_ascii_case("host") {
+            if host.is_some()
+                || v.is_empty()
+                || !v
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-:[]".contains(b))
+            {
+                return Err(400);
+            }
+            std::str::from_utf8(v)
+                .map_err(|_| 400u16)?
+                .parse::<http::uri::Authority>()
+                .map_err(|_| 400u16)?;
+            host = Some(v);
+        } else if h.name.eq_ignore_ascii_case("connection") {
+            for token in v.split(|b| *b == b',') {
+                close |= token.trim_ascii().eq_ignore_ascii_case(b"close");
+                keep |= token.trim_ascii().eq_ignore_ascii_case(b"keep-alive");
+            }
+        } else if h.name.eq_ignore_ascii_case("expect") {
+            if expect || !v.eq_ignore_ascii_case(b"100-continue") {
+                return Err(417);
+            }
+            expect = true;
+        } else if h.name.eq_ignore_ascii_case("authorization") {
+            if auth.is_some() {
+                return Err(400);
+            }
+            auth = Some(v);
         }
-        n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
     }
-    Some(n)
-}
-
-fn parse_head(head: &[u8]) -> Option<Parsed> {
-    let line_end = find_subslice(head, b"\r\n")?;
-    let request_line = &head[..line_end];
-    let sp1 = memchr(b' ', request_line)?;
-    let method = match &request_line[..sp1] {
-        b"GET" => Method::Get,
-        b"POST" => Method::Post,
-        _ => Method::Other,
-    };
-    let rest = &request_line[sp1 + 1..];
-    let sp2 = memchr(b' ', rest)?;
-    let path = (sp1 + 1, sp1 + 1 + sp2);
-    let mut close = &rest[sp2 + 1..] == b"HTTP/1.0";
-
-    let mut content_length = 0usize;
-    let mut host = (0, 0);
-    let mut expect_continue = false;
-    let mut pos = line_end + 2;
-    while pos < head.len() {
-        let end = match find_subslice(&head[pos..], b"\r\n") {
-            Some(offset) => pos + offset,
-            None => head.len(),
-        };
-        let line = &head[pos..end];
-        if let Some(colon) = memchr(b':', line) {
-            let name = &line[..colon];
-            let mut vstart = pos + colon + 1;
-            let vend = end;
-            while vstart < vend && (head[vstart] == b' ' || head[vstart] == b'\t') {
-                vstart += 1;
-            }
-            let mut vstop = vend;
-            while vstop > vstart && (head[vstop - 1] == b' ' || head[vstop - 1] == b'\t') {
-                vstop -= 1;
-            }
-            let value = &head[vstart..vstop];
-            if name.eq_ignore_ascii_case(b"content-length") {
-                content_length = parse_usize(value)?;
-            } else if name.eq_ignore_ascii_case(b"connection") {
-                if value.eq_ignore_ascii_case(b"close") {
-                    close = true;
-                } else if value.eq_ignore_ascii_case(b"keep-alive") {
-                    close = false;
-                }
-            } else if name.eq_ignore_ascii_case(b"expect") {
-                expect_continue = value.eq_ignore_ascii_case(b"100-continue");
-            } else if name.eq_ignore_ascii_case(b"host") {
-                host = (vstart, vstop);
-            }
-        }
-        if end == head.len() {
-            break;
-        }
-        pos = end + 2;
+    if req.version == Some(1) && host.is_none() {
+        return Err(400);
     }
-    Some(Parsed {
-        method,
+    let path = req.path.ok_or(400u16)?;
+    if !path.starts_with('/') || path.contains('#') {
+        return Err(400);
+    }
+    let content_length = length.unwrap_or(0);
+    if content_length > MAX_BODY {
+        return Err(413);
+    }
+    Ok(Parsed {
+        method: req.method.ok_or(400u16)?,
         path,
-        host,
         content_length,
-        close,
-        expect_continue,
+        close: close || (req.version == Some(0) && !keep),
+        expect,
+        auth: auth.unwrap_or(b""),
     })
 }
-
-fn append_json_response(out: &mut Vec<u8>, status: u16, reason: &str, body: &str) {
-    out.extend_from_slice(
-        format!(
-            "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n",
-            body.len()
-        )
-        .as_bytes(),
-    );
+fn connection(out: &mut Vec<u8>, close: bool) {
+    out.extend_from_slice(if close {
+        b"connection: close\r\n\r\n"
+    } else {
+        b"connection: keep-alive\r\n\r\n"
+    });
+}
+fn json(out: &mut Vec<u8>, status: u16, body: &str, close: bool) {
+    use std::io::Write;
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Content Too Large",
+        417 => "Expectation Failed",
+        431 => "Request Header Fields Too Large",
+        503 => "Service Unavailable",
+        _ => "Internal Server Error",
+    };
+    write!(out,"HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\ncache-control: no-store\r\n", body.len()).unwrap();
+    if status == 401 {
+        out.extend_from_slice(b"www-authenticate: Bearer\r\n");
+    }
+    if status == 405 {
+        out.extend_from_slice(b"allow: GET, HEAD, POST\r\n");
+    }
+    connection(out, close);
     out.extend_from_slice(body.as_bytes());
 }
-
-fn append_json_error(out: &mut Vec<u8>, status: u16, message: &str) {
-    append_json_response(
-        out,
-        status,
-        if status == 404 {
-            "Not Found"
-        } else {
-            "Bad Request"
+fn error(out: &mut Vec<u8>, status: u16, close: bool) {
+    json(out, status, &format!("{{\"error\":{status}}}"), close);
+}
+fn authorized(auth: &[u8], token: Option<&str>) -> bool {
+    let Some(token) = token else {
+        return true;
+    };
+    let Some(value) = auth.strip_prefix(b"Bearer ") else {
+        return false;
+    };
+    // Fixed work for equal-length secrets. Keys are restricted to long random ASCII tokens.
+    use subtle::ConstantTimeEq;
+    bool::from(value.ct_eq(token.as_bytes()))
+}
+async fn route(
+    out: &mut Vec<u8>,
+    store: &Arc<Store>,
+    config: &ServerConfig,
+    writes: &Arc<Semaphore>,
+    head: &Parsed<'_>,
+    body: &[u8],
+) {
+    let path = head.path.split('?').next().unwrap();
+    let close = head.close;
+    let method = if head.method == "HEAD" {
+        "GET"
+    } else {
+        head.method
+    };
+    match (method, path) {
+        ("GET", "/health" | "/ready") => {
+            out.extend_from_slice(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n");
+            connection(out, close);
+            out.extend_from_slice(b"ok");
+        }
+        ("GET", "/api/stats") => {
+            if !authorized(head.auth, config.write_token.as_deref()) {
+                return error(out, 401, close);
+            }
+            json(
+                out,
+                200,
+                &format!(
+                    "{{\"urls\":{},\"shards\":{},\"capacity\":{}}}",
+                    store.len(),
+                    store.shard_count(),
+                    store.capacity()
+                ),
+                close,
+            );
+        }
+        ("POST", "/api/shorten") => {
+            if !authorized(head.auth, config.write_token.as_deref()) {
+                return error(out, 401, close);
+            }
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+                return error(out, 400, close);
+            };
+            let Some(url) = value.get("url").and_then(|v| v.as_str()) else {
+                return error(out, 400, close);
+            };
+            if validate_url(url).is_err() {
+                return error(out, 400, close);
+            }
+            let Ok(permit) = writes.clone().try_acquire_owned() else {
+                return error(out, 503, close);
+            };
+            let owned = url.to_owned();
+            let store = store.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                store.shorten(&owned)
+            })
+            .await;
+            match result {
+                Ok(Ok(code)) => json(out,201,&serde_json::json!({"code":code,"short_url":format!("{}/{code}",config.public_base),"long_url":url}).to_string(),close),
+                Ok(Err(e)) if e.kind()==io::ErrorKind::StorageFull => error(out,503,close),
+                _ => { eprintln!("rushort: storage write failed"); error(out,503,close); }
+            }
+        }
+        ("GET", _) => match path.strip_prefix('/').and_then(|code| store.resolve(code)) {
+            Some(url) => {
+                out.extend_from_slice(b"HTTP/1.1 302 Found\r\nlocation: ");
+                out.extend_from_slice(url.as_bytes());
+                out.extend_from_slice(b"\r\ncontent-length: 0\r\n");
+                connection(out, close);
+            }
+            None => error(out, 404, close),
         },
-        &format!("{{\"error\":\"{message}\"}}"),
-    );
-}
-
-fn append_not_found(out: &mut Vec<u8>) {
-    append_json_error(out, 404, "short code not found");
-}
-
-fn append_redirect(out: &mut Vec<u8>, url: &str) {
-    out.extend_from_slice(b"HTTP/1.1 302 Found\r\nlocation: ");
-    out.extend_from_slice(url.as_bytes());
-    out.extend_from_slice(b"\r\ncontent-length: 0\r\nconnection: keep-alive\r\n\r\n");
-}
-
-fn append_shorten_response(out: &mut Vec<u8>, store: &Store, host: &str, body: &[u8]) {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return append_json_error(out, 400, "invalid json body");
-    };
-    let Some(url) = value.get("url").and_then(|v| v.as_str()) else {
-        return append_json_error(out, 400, "missing `url` field");
-    };
-    let url = url.trim();
-    if let Err(e) = validate_url(url) {
-        return append_json_error(out, 400, e);
-    }
-    let code = store.shorten(url);
-    let host = if host.is_empty() { "localhost" } else { host };
-    let body = serde_json::json!({
-        "code": code,
-        "short_url": format!("http://{host}/{code}"),
-        "long_url": url,
-    })
-    .to_string();
-    append_json_response(out, 201, "Created", &body);
-}
-
-fn route(out: &mut Vec<u8>, store: &Store, method: Method, path: &str, host: &str, body: &[u8]) {
-    match method {
-        Method::Get if path == "/health" => {
-            out.extend_from_slice(
-                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok",
-            );
-        }
-        Method::Get if path == "/" => {
-            let body = "rushort: POST /api/shorten {\"url\":\"...\"} | GET /{code} | GET /health | GET /api/stats";
-            out.extend_from_slice(
-                format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n",
-                    body.len()
-                )
-                .as_bytes(),
-            );
-            out.extend_from_slice(body.as_bytes());
-        }
-        Method::Get if path == "/api/stats" => {
-            let body = format!(
-                "{{\"urls\":{},\"shards\":{}}}",
-                store.len(),
-                store.shard_count()
-            );
-            append_json_response(out, 200, "OK", &body);
-        }
-        Method::Post if path == "/api/shorten" => append_shorten_response(out, store, host, body),
-        Method::Get => {
-            let Some(code) = path.strip_prefix('/') else {
-                return append_not_found(out);
-            };
-            let code = code.split('?').next().unwrap_or(code);
-            if code.is_empty() || code.len() > MAX_CODE_LEN {
-                return append_not_found(out);
-            }
-            match store.resolve(code) {
-                Some(url) => append_redirect(out, &url),
-                None => append_not_found(out),
-            }
-        }
-        _ => append_not_found(out),
+        ("POST", _) => error(out, 404, close),
+        _ => error(out, 405, close),
     }
 }
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+fn find_head(buf: &[u8]) -> Option<usize> {
+    memchr::memmem::find(buf, b"\r\n\r\n").map(|n| n + 4)
 }
-
-async fn handle_conn(mut stream: TcpStream, store: Arc<Store>) -> io::Result<()> {
-    let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
+async fn send(stream: &mut TcpStream, bytes: &[u8], limit: Duration) -> io::Result<()> {
+    timeout(limit, stream.write_all(bytes)).await?
+}
+async fn handle_conn(
+    mut stream: TcpStream,
+    store: Arc<Store>,
+    cfg: Arc<ServerConfig>,
+    writes: Arc<Semaphore>,
+) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 16 * 1024];
-    let mut start = 0usize;
-    let mut continue_sent: Option<usize> = None;
-    let mut out: Vec<u8> = Vec::with_capacity(16 * 1024);
-
+    let mut out = Vec::with_capacity(4096);
+    let mut deadline = Instant::now() + cfg.io_timeout;
+    let mut continued = false;
     loop {
-        out.clear();
+        let mut start = 0;
+        let mut processed = 0;
         let mut close = false;
-
-        for _ in 0..MAX_BATCH {
-            if start == buf.len() {
-                break;
-            }
-            let Some(head_rel) = find_subslice(&buf[start..], b"\r\n\r\n") else {
-                break;
-            };
-            let head_end = start + head_rel;
-            let Some(head) = parse_head(&buf[start..head_end]) else {
-                append_json_error(&mut out, 400, "bad request");
-                start = buf.len();
-                close = true;
+        out.clear();
+        while processed < MAX_BATCH {
+            let remaining = &buf[start..];
+            let Some(head_len) = find_head(remaining) else {
+                if remaining.len() >= MAX_HEAD {
+                    error(&mut out, 431, true);
+                    close = true;
+                }
                 break;
             };
-            if head.content_length > MAX_BODY {
-                append_json_error(&mut out, 400, "request body too large");
-                start = buf.len();
+            if head_len > MAX_HEAD {
+                error(&mut out, 431, true);
                 close = true;
                 break;
             }
-            let total = head_end + 4 + head.content_length;
-            if buf.len() < total {
-                if head.expect_continue && continue_sent != Some(start) {
-                    continue_sent = Some(start);
-                    if !out.is_empty() {
-                        stream.write_all(&out).await?;
-                        out.clear();
-                    }
-                    stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+            let head = match parse_head(&remaining[..head_len]) {
+                Ok(h) => h,
+                Err(status) => {
+                    error(&mut out, status, true);
+                    close = true;
+                    break;
+                }
+            };
+            let total = head_len + head.content_length;
+            if remaining.len() < total {
+                if head.expect && !continued {
+                    send(&mut stream, &out, cfg.io_timeout).await?;
+                    out.clear();
+                    send(
+                        &mut stream,
+                        b"HTTP/1.1 100 Continue\r\n\r\n",
+                        cfg.io_timeout,
+                    )
+                    .await?;
+                    continued = true;
                 }
                 break;
             }
-            let path =
-                std::str::from_utf8(&buf[start + head.path.0..start + head.path.1]).unwrap_or("");
-            let host =
-                std::str::from_utf8(&buf[start + head.host.0..start + head.host.1]).unwrap_or("");
+            let response_start = out.len();
             route(
                 &mut out,
                 &store,
-                head.method,
-                path,
-                host,
-                &buf[head_end + 4..total],
-            );
-            start = total;
-            if head.close {
-                close = true;
+                &cfg,
+                &writes,
+                &head,
+                &remaining[head_len..total],
+            )
+            .await;
+            if head.method == "HEAD" {
+                let header_len =
+                    find_head(&out[response_start..]).expect("complete response header");
+                out.truncate(response_start + header_len);
+            }
+            close = head.close;
+            start += total;
+            processed += 1;
+            continued = false;
+            if close {
                 break;
             }
         }
-
         if !out.is_empty() {
-            stream.write_all(&out).await?;
+            send(&mut stream, &out, cfg.io_timeout).await?;
         }
         if close {
+            // Send FIN before bounded draining, so unread rejected input does not reset away the response.
+            timeout(cfg.io_timeout, stream.shutdown()).await??;
+            let _ = timeout(Duration::from_millis(100), async {
+                for _ in 0..4 {
+                    if stream.read(&mut tmp).await.unwrap_or(0) == 0 {
+                        break;
+                    }
+                }
+            })
+            .await;
             return Ok(());
         }
-
         if start > 0 {
             buf.drain(..start);
-            start = 0;
-            continue_sent = None;
+            deadline = Instant::now() + cfg.io_timeout;
         }
-        if buf.len() > MAX_HEAD {
-            return Ok(());
+        if processed == MAX_BATCH {
+            tokio::task::yield_now().await;
+            continue;
         }
-        let n = stream.read(&mut tmp).await?;
+        let n = timeout_at(deadline, stream.read(&mut tmp)).await??;
         if n == 0 {
             return Ok(());
         }
         buf.extend_from_slice(&tmp[..n]);
     }
 }
-
+/// Compatibility entry point for tests and embedded ephemeral use.
 pub async fn serve(listener: TcpListener, store: Arc<Store>) -> io::Result<()> {
+    serve_with_shutdown(
+        listener,
+        store,
+        ServerConfig::default(),
+        std::future::pending::<()>(),
+    )
+    .await
+}
+pub async fn serve_with_shutdown(
+    listener: TcpListener,
+    store: Arc<Store>,
+    config: ServerConfig,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> io::Result<()> {
+    let slots = Arc::new(Semaphore::new(config.max_connections));
+    let writes = Arc::new(Semaphore::new(config.max_writes));
+    let config = Arc::new(config);
+    let mut tasks = JoinSet::new();
+    tokio::pin!(shutdown);
     loop {
-        let (stream, _addr) = listener.accept().await?;
-        let _ = stream.set_nodelay(true);
-        let store = store.clone();
-        tokio::spawn(async move {
-            let _ = handle_conn(stream, store).await;
-        });
+        tokio::select! {
+            biased;
+            _=&mut shutdown => break,
+            Some(result)=tasks.join_next(), if !tasks.is_empty() => { if result.is_err() { eprintln!("rushort: connection task failed"); } }
+            accepted=listener.accept() => {
+                let (stream,_)=accepted?;
+                let Ok(permit)=slots.clone().try_acquire_owned() else { drop(stream);continue; };
+                stream.set_nodelay(true)?; let store=store.clone();let config=config.clone();let writes=writes.clone();
+                tasks.spawn(async move {let _permit=permit; let _=handle_conn(stream,store,config,writes).await;});
+            }
+        }
     }
+    drop(listener);
+    if timeout(Duration::from_secs(10), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        tasks.abort_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -455,7 +494,11 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let mut codes = Vec::with_capacity(5_000);
                 for i in 0..5_000u64 {
-                    codes.push(store.shorten(&format!("https://example.com/{t}/{i}")));
+                    codes.push(
+                        store
+                            .shorten(&format!("https://example.com/{t}/{i}"))
+                            .unwrap(),
+                    );
                 }
                 codes
             }));
@@ -480,7 +523,7 @@ mod tests {
         let mut codes = Vec::new();
         for i in 0..1_000 {
             codes.push((
-                store.shorten(&format!("https://example.com/{i}")),
+                store.shorten(&format!("https://example.com/{i}")).unwrap(),
                 format!("https://example.com/{i}"),
             ));
         }

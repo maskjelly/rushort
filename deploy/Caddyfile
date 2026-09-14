@@ -1,0 +1,19 @@
+# Set RUSHORT_DOMAIN to a domain whose DNS points to this host.
+{$RUSHORT_DOMAIN} {
+    request_body {
+        max_size 8KB
+    }
+    reverse_proxy 127.0.0.1:8080 {
+        health_uri /ready
+        health_interval 10s
+        transport http {
+            versions 1.1
+            keepalive 2s
+            response_header_timeout 8s
+        }
+    }
+    header {
+        Referrer-Policy no-referrer
+        X-Content-Type-Options nosniff
+    }
+}

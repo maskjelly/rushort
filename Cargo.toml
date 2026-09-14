@@ -2,11 +2,29 @@
 name = "rushort"
 version = "0.1.0"
 edition = "2024"
+description = "Minimal high-throughput URL shortener in Rust — raw HTTP/1.1, no web framework"
+license = "MIT"
+repository = "https://github.com/maskjelly/rushort"
+homepage = "https://github.com/maskjelly/rushort"
+readme = "README.md"
+keywords = ["url-shortener", "http", "performance", "sqlite", "tokio"]
+categories = ["web-programming", "network-programming"]
+rust-version = "1.89"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "io-util", "sync"] }
 parking_lot = "0.12"
 serde_json = "1"
+hdrhistogram = { version = "7", default-features = false }
+memchr = "2"
+http = "1"
+subtle = "2.6"
+httparse = "1.10"
+url = "2.5"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = "thin"

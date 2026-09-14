@@ -1,0 +1,25 @@
+[Unit]
+Description=rushort URL shortener
+After=network.target
+
+[Service]
+DynamicUser=yes
+StateDirectory=rushort
+WorkingDirectory=/var/lib/rushort
+EnvironmentFile=/etc/rushort.env
+ExecStart=/usr/local/bin/shortener --bind 127.0.0.1:8080 --db urls.db --public-base ${RUSHORT_PUBLIC_BASE} --max-urls 200000
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LimitNOFILE=4096
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

@@ -1,160 +1,142 @@
-use std::io::Write as _;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Rate,
-    Saturate,
-}
+//! Bounded, independently scheduled load plus an explicitly labeled pipeline microbenchmark.
+use hdrhistogram::Histogram;
+use std::{collections::HashSet, io, sync::Arc, time::Duration};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+    sync::{Barrier, mpsc},
+    time::{Instant, sleep_until, timeout},
+};
 
 #[derive(Clone)]
 struct Config {
+    target: String,
     host: String,
     port: u16,
     rps: u64,
     duration: Duration,
     connections: usize,
-    write_ratio: f64,
-    mode: Mode,
-    timeout: Duration,
-    seed: usize,
     pipeline: usize,
+    queue: usize,
+    writes: f64,
+    misses: f64,
+    seed: usize,
+    preloaded: bool,
+    rate: bool,
+    timeout: Duration,
+    json: Option<String>,
+    max_p99_ms: Option<f64>,
+    key: Option<String>,
 }
-
-fn usage() -> ! {
-    println!(
-        "rushort load simulator\n\n\
-         USAGE: loadgen [OPTIONS]\n\n\
-         OPTIONS:\n  \
-         --target URL       base target, http only (default http://127.0.0.1:8080)\n  \
-         --rps N            request rate to sustain in rate mode (default 2000)\n  \
-         --duration SECS    test duration, fractional ok (default 10)\n  \
-         --connections N    concurrent keep-alive connections (default 64)\n  \
-         --write-ratio F    fraction of POST /api/shorten requests, 0..1 (default 0.05)\n  \
-         --mode MODE        rate | saturate (default rate)\n  \
-         --timeout SECS     per-request timeout (default 5)\n  \
-         --seed N           URLs pre-created for the read pool (default 1000)\n  \
-         --pipeline N       requests in flight per connection, saturate mode only,\n\
-         \x20                  GET-only, amortizes transport cost (default 1)\n  \
-         -h, --help         show this help\n\n\
-         rate mode schedules exactly rps*duration requests (open loop) and fails\n\
-         unless achieved rate >= 99% of target with zero errors and zero\n\
-         verification mismatches. saturate mode sends as fast as possible for the\n\
-         duration to show headroom; --pipeline raises it to measure request\n\
-         processing throughput rather than TCP round-trip cost."
-    );
-    std::process::exit(0);
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
-
-fn parse_args() -> Config {
-    let mut cfg = Config {
-        host: "127.0.0.1".to_owned(),
+fn args() -> io::Result<Config> {
+    let mut c = Config {
+        target: "http://127.0.0.1:8080".into(),
+        host: String::new(),
         port: 8080,
         rps: 2000,
         duration: Duration::from_secs(10),
         connections: 64,
-        write_ratio: 0.05,
-        mode: Mode::Rate,
-        timeout: Duration::from_secs(5),
-        seed: 1000,
         pipeline: 1,
+        queue: 32,
+        writes: 0.,
+        misses: 0.,
+        seed: 1000,
+        preloaded: false,
+        rate: true,
+        timeout: Duration::from_secs(5),
+        json: None,
+        max_p99_ms: None,
+        key: std::env::var("RUSHORT_API_KEY").ok(),
     };
-
-    let mut args = std::env::args().skip(1);
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--target" => {
-                let target = next_val(&mut args, &arg);
-                let (host, port) = parse_target(&target);
-                cfg.host = host;
-                cfg.port = port;
-            }
-            "--rps" => cfg.rps = parse_val(&mut args, &arg),
-            "--duration" => cfg.duration = Duration::from_secs_f64(parse_val(&mut args, &arg)),
-            "--connections" => cfg.connections = parse_val(&mut args, &arg),
-            "--write-ratio" => cfg.write_ratio = parse_val(&mut args, &arg),
-            "--timeout" => cfg.timeout = Duration::from_secs_f64(parse_val(&mut args, &arg)),
-            "--seed" => cfg.seed = parse_val(&mut args, &arg),
-            "--pipeline" => cfg.pipeline = parse_val::<usize>(&mut args, &arg).max(1),
+    let mut a = std::env::args().skip(1);
+    while let Some(flag) = a.next() {
+        if flag == "--help" || flag == "-h" {
+            println!(
+                "loadgen [--target http://127.0.0.1:8080] [--mode rate|saturate]\n  --rps 2000 --duration 10 --connections 64 --pipeline 1 --queue 32\n  --seed 1000 --preloaded --write-ratio 0 --miss-ratio 0\n  --timeout 5 --max-p99-ms N --json result.json\nPipeline >1 is GET-only, independently randomized per request. Latency is full batch completion.\nRate arrivals run independently of responses; bounded queues reject overload and fail the run.\nAll writes and redirect targets are verified. RUSHORT_API_KEY supplies authentication."
+            );
+            std::process::exit(0);
+        }
+        if flag == "--preloaded" {
+            c.preloaded = true;
+            continue;
+        }
+        let v = a
+            .next()
+            .ok_or_else(|| invalid(format!("missing value for {flag}")))?;
+        match flag.as_str() {
+            "--target" => c.target = v,
             "--mode" => {
-                let mode = next_val(&mut args, &arg);
-                cfg.mode = match mode.as_str() {
-                    "rate" => Mode::Rate,
-                    "saturate" => Mode::Saturate,
-                    other => {
-                        eprintln!("loadgen: unknown mode `{other}` (rate | saturate)");
-                        std::process::exit(2);
-                    }
-                };
+                c.rate = match v.as_str() {
+                    "rate" => true,
+                    "saturate" => false,
+                    _ => return Err(invalid("mode must be rate or saturate")),
+                }
             }
-            "-h" | "--help" => usage(),
-            other => {
-                eprintln!("loadgen: unknown argument `{other}` (try --help)");
-                std::process::exit(2);
-            }
+            "--rps" => c.rps = parse(&v)?,
+            "--duration" => c.duration = seconds(&v)?,
+            "--connections" => c.connections = parse(&v)?,
+            "--pipeline" => c.pipeline = parse(&v)?,
+            "--queue" => c.queue = parse(&v)?,
+            "--seed" => c.seed = parse(&v)?,
+            "--write-ratio" => c.writes = parse(&v)?,
+            "--miss-ratio" => c.misses = parse(&v)?,
+            "--timeout" => c.timeout = seconds(&v)?,
+            "--max-p99-ms" => c.max_p99_ms = Some(parse(&v)?),
+            "--json" => c.json = Some(v),
+            _ => return Err(invalid(format!("unknown option {flag}"))),
         }
     }
-
-    if cfg.connections == 0 {
-        eprintln!("loadgen: --connections must be > 0");
-        std::process::exit(2);
+    if !(1..=4096).contains(&c.connections)
+        || !(1..=1024).contains(&c.pipeline)
+        || !(1..=1024).contains(&c.queue)
+        || !(1..=1_000_000).contains(&c.seed)
+        || !(1..=1_000_000_000).contains(&c.rps)
+        || !(0.0..=1.0).contains(&c.writes)
+        || !(0.0..=1.0).contains(&c.misses)
+        || c.writes + c.misses > 1.0
+        || c.max_p99_ms.is_some_and(|n| !n.is_finite() || n <= 0.)
+    {
+        return Err(invalid("invalid bounds, ratios or latency threshold"));
     }
-    if cfg.seed == 0 && cfg.write_ratio <= 0.0 {
-        eprintln!("loadgen: need either --seed > 0 or --write-ratio > 0");
-        std::process::exit(2);
+    if c.pipeline > 1 && c.writes > 0. {
+        return Err(invalid("pipeline >1 requires --write-ratio 0"));
     }
-    if !(0.0..=1.0).contains(&cfg.write_ratio) {
-        eprintln!("loadgen: --write-ratio must be between 0 and 1");
-        std::process::exit(2);
+    if (c.rps as f64 * c.duration.as_secs_f64()).round() < 1. {
+        return Err(invalid(
+            "rate and duration must schedule at least one request",
+        ));
     }
-    cfg
-}
-
-fn next_val(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
-    args.next().unwrap_or_else(|| {
-        eprintln!("loadgen: {flag} requires a value");
-        std::process::exit(2);
-    })
-}
-
-fn parse_val<T: std::str::FromStr>(args: &mut impl Iterator<Item = String>, flag: &str) -> T {
-    let raw = next_val(args, flag);
-    raw.parse().unwrap_or_else(|_| {
-        eprintln!("loadgen: invalid value `{raw}` for {flag}");
-        std::process::exit(2);
-    })
-}
-
-fn parse_target(target: &str) -> (String, u16) {
-    let rest = target.strip_prefix("http://").unwrap_or_else(|| {
-        eprintln!("loadgen: only http:// targets are supported, got `{target}`");
-        std::process::exit(2);
-    });
-    let authority = rest.split('/').next().unwrap_or(rest);
-    match authority.rsplit_once(':') {
-        Some((host, port)) => (
-            host.to_owned(),
-            port.parse().unwrap_or_else(|_| {
-                eprintln!("loadgen: invalid port in `{target}`");
-                std::process::exit(2);
-            }),
-        ),
-        None => (authority.to_owned(), 80),
+    let u = url::Url::parse(&c.target).map_err(|e| invalid(e.to_string()))?;
+    if u.scheme() != "http"
+        || u.host_str().is_none()
+        || u.path() != "/"
+        || u.query().is_some()
+        || u.fragment().is_some()
+        || !u.username().is_empty()
+        || u.password().is_some()
+    {
+        return Err(invalid("target must be an http origin"));
     }
+    c.host = u.host_str().unwrap().trim_matches(['[', ']']).to_owned();
+    c.port = u.port_or_known_default().unwrap();
+    c.target = c.target.trim_end_matches('/').to_owned();
+    Ok(c)
 }
-
+fn parse<T: std::str::FromStr>(s: &str) -> io::Result<T> {
+    s.parse().map_err(|_| invalid("invalid numeric argument"))
+}
+fn seconds(s: &str) -> io::Result<Duration> {
+    let n: f64 = parse(s)?;
+    if !n.is_finite() || n <= 0. || n > 86400. {
+        return Err(invalid("seconds must be finite and within (0,86400]"));
+    }
+    Ok(Duration::from_secs_f64(n))
+}
 struct Rng(u64);
-
 impl Rng {
-    fn new(seed: u64) -> Self {
-        Self(seed | 1)
-    }
-
-    #[inline]
     fn next(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
@@ -163,723 +145,488 @@ impl Rng {
         self.0 = x;
         x
     }
-
-    #[inline]
     fn chance(&mut self, p: f64) -> bool {
-        if p <= 0.0 {
-            return false;
-        }
-        if p >= 1.0 {
-            return true;
-        }
-        ((self.next() >> 11) as f64 / (1u64 << 53) as f64) < p
+        (self.next() >> 11) as f64 / ((1u64 << 53) as f64) < p
     }
 }
-
+struct Seed {
+    code: String,
+    request: Vec<u8>,
+    url: String,
+}
 struct Response {
     status: u16,
-    location: Option<String>,
+    location: String,
     body: Vec<u8>,
 }
-
 struct Conn {
     stream: TcpStream,
-    authority: String,
     buf: Vec<u8>,
-    req: Vec<u8>,
+    offset: usize,
     tmp: Vec<u8>,
 }
-
 impl Conn {
-    async fn connect(host: &str, port: u16) -> std::io::Result<Self> {
-        let stream = TcpStream::connect((host, port)).await?;
+    async fn connect(c: &Config) -> io::Result<Self> {
+        let stream = timeout(c.timeout, TcpStream::connect((c.host.as_str(), c.port))).await??;
         stream.set_nodelay(true)?;
         Ok(Self {
             stream,
-            authority: format!("{host}:{port}"),
-            buf: Vec::with_capacity(8192),
-            req: Vec::with_capacity(512),
-            tmp: vec![0u8; 16 * 1024],
+            buf: Vec::with_capacity(16384),
+            offset: 0,
+            tmp: vec![0; 16384],
         })
     }
-
-    async fn get(&mut self, path: &str) -> std::io::Result<Response> {
-        self.req.clear();
-        write!(
-            self.req,
-            "GET {path} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",
-            self.authority
-        )
-        .unwrap();
-        self.stream.write_all(&self.req).await?;
-        self.read_response().await
-    }
-
-    async fn pipeline_get(
-        &mut self,
-        path: &str,
-        count: usize,
-        expected: &str,
-    ) -> std::io::Result<(usize, usize)> {
-        self.req.clear();
-        for _ in 0..count {
-            write!(
-                self.req,
-                "GET {path} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n",
-                self.authority
-            )
-            .unwrap();
-        }
-        self.stream.write_all(&self.req).await?;
-        let mut ok = 0;
-        let mut mismatched = 0;
-        for _ in 0..count {
-            let resp = self.read_response().await?;
-            if resp.status == 302 && resp.location.as_deref() == Some(expected) {
-                ok += 1;
-            } else {
-                mismatched += 1;
-            }
-        }
-        Ok((ok, mismatched))
-    }
-
-    async fn post_json(&mut self, path: &str, body: &[u8]) -> std::io::Result<Response> {
-        self.req.clear();
-        write!(
-            self.req,
-            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
-            self.authority,
-            body.len()
-        )
-        .unwrap();
-        self.req.extend_from_slice(body);
-        self.stream.write_all(&self.req).await?;
-        self.read_response().await
-    }
-
-    async fn read_response(&mut self) -> std::io::Result<Response> {
+    async fn response(&mut self) -> io::Result<Response> {
         loop {
-            if let Some((resp, used)) = parse_response(&self.buf)? {
-                self.buf.drain(..used);
-                return Ok(resp);
+            let available = &self.buf[self.offset..];
+            if let Some(h) = memchr::memmem::find(available, b"\r\n\r\n") {
+                if h > 16384 {
+                    return Err(invalid("response head too large"));
+                }
+                let mut headers = [httparse::EMPTY_HEADER; 32];
+                let mut res = httparse::Response::new(&mut headers);
+                res.parse(&available[..h + 4])
+                    .map_err(|_| invalid("bad response"))?;
+                let status = res.code.ok_or_else(|| invalid("missing status"))?;
+                let mut length = None;
+                let mut location = None;
+                for hdr in res.headers.iter() {
+                    if hdr.name.eq_ignore_ascii_case("content-length") {
+                        if length.is_some() {
+                            return Err(invalid("duplicate response length"));
+                        }
+                        length = Some(parse::<usize>(
+                            std::str::from_utf8(hdr.value).map_err(|_| invalid("bad length"))?,
+                        )?);
+                    }
+                    if hdr.name.eq_ignore_ascii_case("transfer-encoding") {
+                        return Err(invalid("transfer encoding unsupported"));
+                    }
+                    if hdr.name.eq_ignore_ascii_case("location") {
+                        if location.is_some() {
+                            return Err(invalid("duplicate location"));
+                        }
+                        location = Some(
+                            std::str::from_utf8(hdr.value)
+                                .map_err(|_| invalid("invalid location"))?,
+                        );
+                    }
+                }
+                let n = length.ok_or_else(|| invalid("response requires content-length"))?;
+                if n > 65536 {
+                    return Err(invalid("response body too large"));
+                }
+                if available.len() >= h + 4 + n {
+                    let r = Response {
+                        status,
+                        location: location.unwrap_or("").into(),
+                        body: available[h + 4..h + 4 + n].to_vec(),
+                    };
+                    self.offset += h + 4 + n;
+                    return Ok(r);
+                }
+            } else if available.len() > 16384 {
+                return Err(invalid("response head too large"));
+            }
+            if self.offset > 0 {
+                self.buf.drain(..self.offset);
+                self.offset = 0;
             }
             let n = self.stream.read(&mut self.tmp).await?;
             if n == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed by peer",
-                ));
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
             }
             self.buf.extend_from_slice(&self.tmp[..n]);
         }
     }
+    async fn one(&mut self, req: &[u8]) -> io::Result<Response> {
+        self.stream.write_all(req).await?;
+        self.response().await
+    }
 }
-
-fn invalid(msg: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_owned())
-}
-
-fn parse_response(buf: &[u8]) -> std::io::Result<Option<(Response, usize)>> {
-    let Some(hdr_end) = find_subslice(buf, b"\r\n\r\n") else {
-        return Ok(None);
-    };
-    let head = &buf[..hdr_end];
-    let mut lines = head.split(|&b| b == b'\n');
-    let status =
-        parse_status(lines.next().unwrap_or(b"")).ok_or_else(|| invalid("bad status line"))?;
-
-    let mut content_length = 0usize;
-    let mut location = None;
-    for line in lines {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(colon) = line.iter().position(|&b| b == b':') else {
-            continue;
-        };
-        let (name, value) = line.split_at(colon);
-        let value = trim_ascii(&value[1..]);
-        if name.eq_ignore_ascii_case(b"content-length") {
-            content_length = std::str::from_utf8(value)
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| invalid("bad content-length"))?;
-        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-            return Err(invalid("chunked responses are not supported by loadgen"));
-        } else if name.eq_ignore_ascii_case(b"location") {
-            location = Some(String::from_utf8_lossy(value).into_owned());
+fn request(c: &Config, method: &str, path: &str, body: &str) -> Vec<u8> {
+    let authority = c.target.strip_prefix("http://").unwrap();
+    let mut r = format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\n");
+    if method == "POST" {
+        r.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+        if let Some(key) = &c.key {
+            r.push_str(&format!("Authorization: Bearer {key}\r\n"));
         }
     }
-
-    let end = hdr_end + 4 + content_length;
-    if buf.len() < end {
-        return Ok(None);
-    }
-    Ok(Some((
-        Response {
-            status,
-            location,
-            body: buf[hdr_end + 4..end].to_vec(),
-        },
-        end,
-    )))
+    r.push_str("\r\n");
+    r.push_str(body);
+    r.into_bytes()
 }
-
-fn parse_status(line: &[u8]) -> Option<u16> {
-    let mut parts = line.split(|&b| b == b' ');
-    let _version = parts.next()?;
-    let code = parts.next()?;
-    std::str::from_utf8(code).ok()?.parse().ok()
+fn shortened(r: &Response, expected: &str) -> io::Result<String> {
+    if r.status != 201 {
+        return Err(invalid(format!("POST status {}", r.status)));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&r.body).map_err(|_| invalid("invalid POST JSON"))?;
+    let code = v["code"].as_str().ok_or_else(|| invalid("missing code"))?;
+    if v["long_url"].as_str() != Some(expected)
+        || rushort::base62_decode(code).is_none()
+        || code.len() > 11
+        || (code.len() > 1 && code.starts_with('0'))
+    {
+        return Err(invalid("POST mapping mismatch"));
+    }
+    Ok(code.to_owned())
 }
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn trim_ascii(mut b: &[u8]) -> &[u8] {
-    while let Some((first, rest)) = b.split_first() {
-        if *first == b' ' || *first == b'\t' {
-            b = rest;
-        } else {
-            break;
-        }
-    }
-    while let Some((last, rest)) = b.split_last() {
-        if *last == b' ' || *last == b'\t' || *last == b'\r' {
-            b = rest;
-        } else {
-            break;
-        }
-    }
-    b
-}
-
-fn parse_shorten_out(body: &[u8]) -> Result<(String, String), String> {
-    let value: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| format!("bad JSON: {e}"))?;
-    let code = value
-        .get("code")
-        .and_then(|v| v.as_str())
-        .ok_or("missing `code`")?
-        .to_owned();
-    let long_url = value
-        .get("long_url")
-        .and_then(|v| v.as_str())
-        .ok_or("missing `long_url`")?
-        .to_owned();
-    Ok((code, long_url))
-}
-
-#[derive(Default)]
-struct TaskResult {
-    read_lat: Vec<u32>,
-    write_lat: Vec<u32>,
-    ok_reads: u64,
-    ok_writes: u64,
-    status_other: u64,
-    errors: u64,
-    verify_fail: u64,
-    max_lag_us: u64,
-    writes: Vec<(String, String)>,
-    samples: Vec<String>,
-}
-
-impl TaskResult {
-    fn note(&mut self, msg: String) {
-        if self.samples.len() < 8 {
-            self.samples.push(msg);
-        }
-    }
-}
-
-struct Task {
-    conn: Conn,
-    cfg: Config,
-    seeds: Arc<Vec<(String, String)>>,
-    local: Vec<(String, String)>,
-    rng: Rng,
-    res: TaskResult,
-}
-
-impl Task {
-    fn new(conn: Conn, cfg: Config, seeds: Arc<Vec<(String, String)>>, id: usize) -> Self {
-        let seed = 0x9e37_79b9_7f4a_7c15u64
-            .wrapping_mul(id as u64 + 1)
-            .wrapping_add(0xdead_beef);
-        Self {
-            conn,
-            cfg,
-            seeds,
-            local: Vec::new(),
-            rng: Rng::new(seed),
-            res: TaskResult::default(),
-        }
-    }
-
-    fn finish(mut self) -> TaskResult {
-        self.res.writes = std::mem::take(&mut self.local);
-        self.res
-    }
-
-    async fn step(&mut self, id: usize, seq: u64) {
-        if self.cfg.pipeline > 1 {
-            self.pipelined().await;
-        } else if self.rng.chance(self.cfg.write_ratio) {
-            self.write(id, seq).await;
-        } else {
-            self.read().await;
-        }
-    }
-
-    async fn pipelined(&mut self) {
-        let (code, expected) = self.pick();
-        let path = format!("/{code}");
-        let depth = self.cfg.pipeline;
-        let t0 = Instant::now();
-        match tokio::time::timeout(
-            self.cfg.timeout,
-            self.conn.pipeline_get(&path, depth, &expected),
-        )
-        .await
-        {
-            Ok(Ok((ok, mismatched))) => {
-                self.res.read_lat.push(elapsed_us(t0) / depth as u32);
-                self.res.ok_reads += ok as u64;
-                self.res.verify_fail += mismatched as u64;
-            }
-            Ok(Err(e)) => {
-                self.res.errors += 1;
-                self.res.note(format!("pipeline GET failed: {e}"));
-                self.reconnect().await;
-            }
-            Err(_) => {
-                self.res.errors += 1;
-                self.res.note("pipeline GET timed out".to_owned());
-                self.reconnect().await;
-            }
-        }
-    }
-
-    async fn read(&mut self) {
-        let (code, expected) = self.pick();
-        let path = format!("/{code}");
-        let t0 = Instant::now();
-        match tokio::time::timeout(self.cfg.timeout, self.conn.get(&path)).await {
-            Ok(Ok(resp)) if resp.status == 302 => {
-                self.res.read_lat.push(elapsed_us(t0));
-                if resp.location.as_deref() == Some(expected.as_str()) {
-                    self.res.ok_reads += 1;
-                } else {
-                    self.res.verify_fail += 1;
-                    self.res.note(format!(
-                        "location mismatch for `{code}`: expected `{expected}`, got `{:?}`",
-                        resp.location
-                    ));
-                }
-            }
-            Ok(Ok(resp)) => {
-                self.res.status_other += 1;
-                self.res
-                    .note(format!("unexpected status {} for GET /{code}", resp.status));
-            }
-            Ok(Err(e)) => {
-                self.res.errors += 1;
-                self.res.note(format!("GET /{code} failed: {e}"));
-                self.reconnect().await;
-            }
-            Err(_) => {
-                self.res.errors += 1;
-                self.res.note(format!("GET /{code} timed out"));
-                self.reconnect().await;
-            }
-        }
-    }
-
-    async fn write(&mut self, id: usize, seq: u64) {
-        let url = format!("https://example.com/load/{id}/{seq}");
-        let body = format!("{{\"url\":\"{url}\"}}");
-        let t0 = Instant::now();
-        match tokio::time::timeout(
-            self.cfg.timeout,
-            self.conn.post_json("/api/shorten", body.as_bytes()),
-        )
-        .await
-        {
-            Ok(Ok(resp)) if resp.status == 201 => {
-                self.res.write_lat.push(elapsed_us(t0));
-                match parse_shorten_out(&resp.body) {
-                    Ok((code, long_url)) => {
-                        self.res.ok_writes += 1;
-                        self.local.push((code, long_url));
-                    }
-                    Err(e) => {
-                        self.res.status_other += 1;
-                        self.res.note(format!("bad JSON on POST: {e}"));
-                    }
-                }
-            }
-            Ok(Ok(resp)) => {
-                self.res.status_other += 1;
-                self.res.note(format!(
-                    "unexpected status {} on POST /api/shorten",
-                    resp.status
-                ));
-            }
-            Ok(Err(e)) => {
-                self.res.errors += 1;
-                self.res.note(format!("POST failed: {e}"));
-                self.reconnect().await;
-            }
-            Err(_) => {
-                self.res.errors += 1;
-                self.res.note("POST timed out".to_owned());
-                self.reconnect().await;
-            }
-        }
-    }
-
-    fn pick(&mut self) -> (String, String) {
-        let r = self.rng.next();
-        let use_local = !self.local.is_empty() && (r % 100) < 80;
-        let src = if use_local { &self.local } else { &self.seeds };
-        let idx = ((r >> 8) as usize) % src.len();
-        (src[idx].0.clone(), src[idx].1.clone())
-    }
-
-    async fn reconnect(&mut self) {
-        for attempt in 1..=5 {
-            match Conn::connect(&self.cfg.host, self.cfg.port).await {
-                Ok(conn) => {
-                    self.conn = conn;
-                    return;
-                }
-                Err(e) => {
-                    self.res
-                        .note(format!("reconnect attempt {attempt} failed: {e}"));
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-            }
-        }
-        eprintln!(
-            "loadgen: FATAL: cannot reconnect to {}:{}",
-            self.cfg.host, self.cfg.port
-        );
-        std::process::exit(1);
-    }
-}
-
-fn elapsed_us(t0: Instant) -> u32 {
-    t0.elapsed().as_micros().min(u32::MAX as u128) as u32
-}
-
-async fn seed_pool(cfg: &Config) -> Vec<(String, String)> {
-    let mut conn = match Conn::connect(&cfg.host, cfg.port).await {
-        Ok(conn) => conn,
-        Err(e) => {
-            eprintln!("loadgen: cannot connect to {}:{}: {e}", cfg.host, cfg.port);
-            std::process::exit(1);
-        }
-    };
-    let mut pool = Vec::with_capacity(cfg.seed);
-    for i in 0..cfg.seed {
+async fn seeds(c: &Config) -> io::Result<Vec<Seed>> {
+    let mut conn = Conn::connect(c).await?;
+    let mut seen = HashSet::new();
+    let mut result = Vec::with_capacity(c.seed);
+    for i in 0..c.seed {
         let url = format!("https://example.com/seed/{i}");
-        let body = format!("{{\"url\":\"{url}\"}}");
-        match tokio::time::timeout(cfg.timeout, conn.post_json("/api/shorten", body.as_bytes()))
-            .await
-        {
-            Ok(Ok(resp)) if resp.status == 201 => match parse_shorten_out(&resp.body) {
-                Ok(out) => pool.push(out),
-                Err(e) => {
-                    eprintln!("loadgen: seed {i}: bad JSON: {e}");
-                    std::process::exit(1);
-                }
-            },
-            Ok(Ok(resp)) => {
-                eprintln!("loadgen: seed {i}: unexpected status {}", resp.status);
-                std::process::exit(1);
-            }
-            Ok(Err(e)) => {
-                eprintln!("loadgen: seed {i}: {e}");
-                std::process::exit(1);
-            }
-            Err(_) => {
-                eprintln!("loadgen: seed {i}: timed out");
-                std::process::exit(1);
+        let code = if c.preloaded {
+            rushort::base62_encode(i as u64)
+        } else {
+            let req = request(
+                c,
+                "POST",
+                "/api/shorten",
+                &serde_json::json!({"url":url}).to_string(),
+            );
+            let res = timeout(c.timeout, conn.one(&req)).await??;
+            shortened(&res, &url)?
+        };
+        if !seen.insert(code.clone()) {
+            return Err(invalid("duplicate seed code"));
+        }
+        let req = request(c, "GET", &format!("/{code}"), "");
+        let res = timeout(c.timeout, conn.one(&req)).await??;
+        if res.status != 302 || res.location != url {
+            return Err(invalid("seed redirect mismatch"));
+        }
+        result.push(Seed {
+            code,
+            request: req,
+            url,
+        });
+    }
+    Ok(result)
+}
+fn hist() -> Histogram<u64> {
+    Histogram::new_with_bounds(1, 86_400_000_000, 3).unwrap()
+}
+struct Stats {
+    sent: u64,
+    ok: u64,
+    reads: u64,
+    writes: u64,
+    misses: u64,
+    status: u64,
+    mismatch: u64,
+    errors: u64,
+    lat: Histogram<u64>,
+    lag: Histogram<u64>,
+    created: Vec<(String, String)>,
+    first_error: Option<String>,
+}
+impl Default for Stats {
+    fn default() -> Self {
+        Self {
+            sent: 0,
+            ok: 0,
+            reads: 0,
+            writes: 0,
+            misses: 0,
+            status: 0,
+            mismatch: 0,
+            errors: 0,
+            lat: hist(),
+            lag: hist(),
+            created: Vec::new(),
+            first_error: None,
+        }
+    }
+}
+impl Stats {
+    fn note(&mut self, e: impl ToString) {
+        if self.first_error.is_none() {
+            self.first_error = Some(e.to_string());
+        }
+    }
+    fn merge(&mut self, s: Self) {
+        self.sent += s.sent;
+        self.ok += s.ok;
+        self.reads += s.reads;
+        self.writes += s.writes;
+        self.misses += s.misses;
+        self.status += s.status;
+        self.mismatch += s.mismatch;
+        self.errors += s.errors;
+        self.lat.add(s.lat).unwrap();
+        self.lag.add(s.lag).unwrap();
+        self.created.extend(s.created);
+        if self.first_error.is_none() {
+            self.first_error = s.first_error;
+        }
+    }
+}
+#[derive(Clone, Copy)]
+struct Job {
+    sequence: u64,
+    count: usize,
+    deadline: Instant,
+}
+struct Worker {
+    conn: Option<Conn>,
+    rng: Rng,
+    stats: Stats,
+    request: Vec<u8>,
+    expected: Vec<Option<usize>>,
+}
+impl Worker {
+    async fn step(&mut self, c: &Config, pool: &[Seed], job: Job, id: usize) {
+        self.stats.sent += job.count as u64;
+        let start = Instant::now();
+        let lag = start.saturating_duration_since(job.deadline);
+        let _ = self
+            .stats
+            .lag
+            .record(lag.as_micros().min(86_400_000_000) as u64);
+        let outcome = timeout(c.timeout, self.exchange(c, pool, job, id)).await;
+        // Includes scheduling delay; for pipelines this is full batch completion, not divided by N.
+        let us = Instant::now()
+            .saturating_duration_since(job.deadline)
+            .as_micros()
+            .min(86_400_000_000) as u64;
+        let _ = self.stats.lat.record(us);
+        match outcome {
+            Ok(Ok(())) => {}
+            other => {
+                self.stats.note(match other {
+                    Ok(Err(e)) => e.to_string(),
+                    _ => "request/batch timed out".into(),
+                });
+                self.conn = None;
             }
         }
     }
-    pool
-}
-
-async fn run_rate(cfg: &Config, seeds: Arc<Vec<(String, String)>>) {
-    let total = (cfg.rps as f64 * cfg.duration.as_secs_f64()).round() as u64;
-    let per_step = cfg.pipeline as u64;
-    let batches = total.div_ceil(cfg.connections as u64 * per_step).max(1);
-    let start = Instant::now() + Duration::from_millis(500);
-
-    let mut handles = Vec::with_capacity(cfg.connections);
-    for id in 0..cfg.connections {
-        let cfg = cfg.clone();
-        let seeds = seeds.clone();
-        handles.push(tokio::spawn(async move {
-            let mut task = Task::new(connect_or_die(&cfg).await, cfg.clone(), seeds, id);
-            let period = cfg.duration.as_secs_f64() / batches as f64;
-            for seq in 0..batches {
-                let deadline = start + Duration::from_secs_f64(period * seq as f64);
-                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-                let lag = Instant::now().saturating_duration_since(deadline);
-                task.res.max_lag_us = task.res.max_lag_us.max(lag.as_micros() as u64);
-                task.step(id, seq).await;
+    async fn exchange(&mut self, c: &Config, pool: &[Seed], job: Job, id: usize) -> io::Result<()> {
+        if self.conn.is_none() {
+            self.conn = Some(Conn::connect(c).await?);
+        }
+        let conn = self.conn.as_mut().unwrap();
+        if c.pipeline == 1 && self.rng.chance(c.writes) {
+            if self.stats.created.len() >= 1_000_000 / c.connections {
+                return Err(invalid("verification capacity reached; shorten run"));
             }
-            task.finish()
+            let url = format!("https://example.com/load/{id}/{}", job.sequence);
+            let req = request(
+                c,
+                "POST",
+                "/api/shorten",
+                &serde_json::json!({"url":url}).to_string(),
+            );
+            let r = conn.one(&req).await?;
+            if r.status != 201 {
+                self.stats.status += 1;
+                self.stats.note(format!("POST status {}", r.status));
+                return Ok(());
+            }
+            match shortened(&r, &url) {
+                Ok(code) => {
+                    self.stats.ok += 1;
+                    self.stats.writes += 1;
+                    self.stats.created.push((code, url));
+                }
+                Err(e) => {
+                    self.stats.mismatch += 1;
+                    self.stats.note(e);
+                }
+            }
+            return Ok(());
+        }
+        self.request.clear();
+        self.expected.clear();
+        for _ in 0..job.count {
+            if self.rng.chance(c.misses / (1.0 - c.writes)) {
+                self.request
+                    .extend_from_slice(&request(c, "GET", "/missing-code", ""));
+                self.expected.push(None);
+            } else {
+                let idx = self.rng.next() as usize % pool.len();
+                self.request.extend_from_slice(&pool[idx].request);
+                self.expected.push(Some(idx));
+            }
+        }
+        conn.stream.write_all(&self.request).await?;
+        for expected in &self.expected {
+            let r = conn.response().await?;
+            match expected {
+                Some(_) if r.status != 302 => self.stats.status += 1,
+                Some(idx) if r.location != pool[*idx].url => self.stats.mismatch += 1,
+                Some(_) => {
+                    self.stats.ok += 1;
+                    self.stats.reads += 1;
+                }
+                None if r.status != 404 => self.stats.status += 1,
+                None => {
+                    self.stats.ok += 1;
+                    self.stats.misses += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+async fn verify(c: &Config, pool: &[Seed], created: &[(String, String)]) -> io::Result<usize> {
+    let mut codes: HashSet<&str> = pool.iter().map(|s| s.code.as_str()).collect();
+    let mut conn = Conn::connect(c).await?;
+    for (code, url) in created {
+        if !codes.insert(code.as_str()) {
+            return Err(invalid("duplicate code across writes"));
+        }
+        let res = timeout(
+            c.timeout,
+            conn.one(&request(c, "GET", &format!("/{code}"), "")),
+        )
+        .await??;
+        if res.status != 302 || res.location != *url {
+            return Err(invalid("post-run redirect mismatch"));
+        }
+    }
+    for seed in pool {
+        let res = timeout(c.timeout, conn.one(&seed.request)).await??;
+        if res.status != 302 || res.location != seed.url {
+            return Err(invalid("seed mapping changed during run"));
+        }
+    }
+    Ok(created.len())
+}
+async fn run(c: Config) -> io::Result<bool> {
+    let pool = Arc::new(seeds(&c).await?);
+    eprintln!(
+        "loadgen: verified {} seeds; preparing connections",
+        pool.len()
+    );
+    // Connections are established before the shared start; no hidden warm-up traffic is counted.
+    let mut connections = Vec::new();
+    for _ in 0..c.connections {
+        connections.push(Conn::connect(&c).await?);
+    }
+    let start = Instant::now() + Duration::from_millis(100);
+    let end = start + c.duration;
+    let total = (c.rps as f64 * c.duration.as_secs_f64()).round() as u64;
+    let mut tasks = Vec::new();
+    let mut producers = Vec::new();
+    let barrier = Arc::new(Barrier::new(c.connections + 1));
+    for (id, conn) in connections.into_iter().enumerate() {
+        let cfg = c.clone();
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        let (tx, mut rx) = mpsc::channel::<Job>(c.queue);
+        if c.rate {
+            let cfg = cfg.clone();
+            producers.push(tokio::spawn(async move {
+                let mut dropped = 0u64;
+                let stride = cfg.connections as u64 * cfg.pipeline as u64;
+                let mut sequence = id as u64 * cfg.pipeline as u64;
+                while sequence < total {
+                    let deadline =
+                        start + Duration::from_secs_f64(sequence as f64 / cfg.rps as f64);
+                    sleep_until(deadline).await;
+                    let count = (total - sequence).min(cfg.pipeline as u64) as usize;
+                    if tx
+                        .try_send(Job {
+                            sequence,
+                            count,
+                            deadline,
+                        })
+                        .is_err()
+                    {
+                        dropped += count as u64;
+                    }
+                    sequence += stride;
+                }
+                dropped
+            }));
+        } else {
+            drop(tx);
+        }
+        tasks.push(tokio::spawn(async move {
+            let mut worker = Worker {
+                conn: Some(conn),
+                rng: Rng(0x9e3779b97f4a7c15u64.wrapping_mul(id as u64 + 1)),
+                stats: Stats::default(),
+                request: Vec::new(),
+                expected: Vec::new(),
+            };
+            barrier.wait().await;
+            sleep_until(start).await;
+            if cfg.rate {
+                while let Some(job) = rx.recv().await {
+                    worker.step(&cfg, &pool, job, id).await;
+                }
+            } else {
+                let mut sequence = 0;
+                while Instant::now() < end {
+                    let job = Job {
+                        sequence,
+                        count: cfg.pipeline,
+                        deadline: Instant::now(),
+                    };
+                    worker.step(&cfg, &pool, job, id).await;
+                    sequence += cfg.pipeline as u64;
+                }
+            }
+            // Every attempted request has exactly one accounting outcome, including partial batches.
+            worker.stats.errors =
+                worker.stats.sent - worker.stats.ok - worker.stats.status - worker.stats.mismatch;
+            worker.stats
         }));
     }
-
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        results.push(handle.await.expect("worker task panicked"));
+    barrier.wait().await;
+    let mut dropped = 0;
+    for task in producers {
+        dropped += task.await.map_err(io::Error::other)?;
     }
-    let elapsed = Instant::now().saturating_duration_since(start);
-    report(cfg, results, elapsed, Some(total)).await;
+    let mut stats = Stats::default();
+    for task in tasks {
+        stats.merge(task.await.map_err(io::Error::other)?);
+    }
+    sleep_until(end).await;
+    let elapsed = Instant::now().duration_since(start);
+    let verification = verify(&c, &pool, &stats.created).await;
+    let verified = verification.as_ref().copied().unwrap_or(0);
+    let achieved = stats.ok as f64 / elapsed.as_secs_f64();
+    let p99 = stats.lat.value_at_quantile(0.99) as f64 / 1000.;
+    let accounting = !c.rate || stats.sent + dropped == total;
+    let pass = stats.ok > 0
+        && stats.errors == 0
+        && stats.status == 0
+        && stats.mismatch == 0
+        && dropped == 0
+        && accounting
+        && verification.is_ok()
+        && (!c.rate || (stats.ok == total && achieved >= c.rps as f64 * 0.99))
+        && c.max_p99_ms.is_none_or(|limit| p99 <= limit);
+    let report = serde_json::json!({"pass":pass,"mode":if c.rate{"rate"}else{"saturate"},"target":c.target,"duration_requested_s":c.duration.as_secs_f64(),"elapsed_s":elapsed.as_secs_f64(),"target_rps":if c.rate{Some(c.rps)}else{None},"planned":if c.rate{Some(total)}else{None},"attempted":stats.sent,"ok":stats.ok,"dropped":dropped,"transport_errors":stats.errors,"unexpected_status":stats.status,"mismatches":stats.mismatch,"reads":stats.reads,"writes":stats.writes,"misses":stats.misses,"verified_writes":verified,"verification_error":verification.err().map(|e|e.to_string()),"rps":achieved,"pipeline":c.pipeline,"queue_batches_per_connection":c.queue,"connections":c.connections,"seed":c.seed,"write_ratio":c.writes,"miss_ratio":c.misses,"latency_kind":if c.pipeline>1{"scheduled batch completion"}else{"scheduled request completion"},"p50_ms":stats.lat.value_at_quantile(0.5) as f64/1000.,"p99_ms":p99,"max_ms":stats.lat.max() as f64/1000.,"max_send_lag_ms":stats.lag.max() as f64/1000.,"first_error":stats.first_error});
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    println!("RESULT: {}", if pass { "PASS" } else { "FAIL" });
+    if let Some(path) = c.json {
+        std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+    }
+    Ok(pass)
 }
-
-async fn run_saturate(cfg: &Config, seeds: Arc<Vec<(String, String)>>) {
-    let start = Instant::now() + Duration::from_millis(500);
-    let end = start + cfg.duration;
-
-    let mut handles = Vec::with_capacity(cfg.connections);
-    for id in 0..cfg.connections {
-        let cfg = cfg.clone();
-        let seeds = seeds.clone();
-        handles.push(tokio::spawn(async move {
-            let mut task = Task::new(connect_or_die(&cfg).await, cfg.clone(), seeds, id);
-            let mut seq = 0u64;
-            while Instant::now() < end {
-                task.step(id, seq).await;
-                seq += 1;
-            }
-            task.finish()
-        }));
-    }
-
-    let mut results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        results.push(handle.await.expect("worker task panicked"));
-    }
-    let elapsed = Instant::now().saturating_duration_since(start);
-    report(cfg, results, elapsed, None).await;
-}
-
-async fn connect_or_die(cfg: &Config) -> Conn {
-    match Conn::connect(&cfg.host, cfg.port).await {
-        Ok(conn) => conn,
+#[tokio::main]
+async fn main() {
+    let result = match args() {
+        Ok(c) => run(c).await,
+        Err(e) => Err(e),
+    };
+    match result {
+        Ok(true) => {}
+        Ok(false) => std::process::exit(1),
         Err(e) => {
-            eprintln!("loadgen: cannot connect to {}:{}: {e}", cfg.host, cfg.port);
+            eprintln!("loadgen: {e}");
             std::process::exit(1);
         }
-    }
-}
-
-async fn report(
-    cfg: &Config,
-    results: Vec<TaskResult>,
-    elapsed: Duration,
-    target_total: Option<u64>,
-) {
-    let mut read_lat = Vec::new();
-    let mut write_lat = Vec::new();
-    let mut ok_reads = 0u64;
-    let mut ok_writes = 0u64;
-    let mut status_other = 0u64;
-    let mut errors = 0u64;
-    let mut verify_fail = 0u64;
-    let mut max_lag_us = 0u64;
-    let mut writes_all = Vec::new();
-    let mut samples = Vec::new();
-
-    for result in results {
-        read_lat.extend_from_slice(&result.read_lat);
-        write_lat.extend_from_slice(&result.write_lat);
-        ok_reads += result.ok_reads;
-        ok_writes += result.ok_writes;
-        status_other += result.status_other;
-        errors += result.errors;
-        verify_fail += result.verify_fail;
-        max_lag_us = max_lag_us.max(result.max_lag_us);
-        writes_all.extend(result.writes);
-        samples.extend(result.samples);
-    }
-
-    read_lat.sort_unstable();
-    write_lat.sort_unstable();
-    let mut all_lat: Vec<u32> = read_lat.iter().chain(write_lat.iter()).copied().collect();
-    all_lat.sort_unstable();
-
-    let total_ok = ok_reads + ok_writes;
-    let achieved = total_ok as f64 / elapsed.as_secs_f64();
-
-    let mode = match cfg.mode {
-        Mode::Rate => format!("rate @ {} req/s", cfg.rps),
-        Mode::Saturate => "saturate".to_owned(),
-    };
-    println!("\n=== rushort load simulator ===");
-    println!(
-        "target:           http://{}:{}  ({mode})",
-        cfg.host, cfg.port
-    );
-    println!(
-        "duration:         {:.2}s   connections: {}   mix: {:.0}% GET / {:.0}% POST",
-        elapsed.as_secs_f64(),
-        cfg.connections,
-        (1.0 - cfg.write_ratio) * 100.0,
-        cfg.write_ratio * 100.0
-    );
-    if cfg.pipeline > 1 {
-        println!(
-            "pipeline:         depth {} (GET batches, per-request latency estimated from batch time)",
-            cfg.pipeline
-        );
-    }
-    println!(
-        "requests:         {total_ok} ok  (GET {ok_reads}, POST {ok_writes})   unexpected-status {status_other}   errors {errors}   verify-fail {verify_fail}"
-    );
-    if let Some(target) = target_total {
-        println!(
-            "achieved:         {achieved:.1} req/s   plan {target} req   (target {} req/s)",
-            cfg.rps
-        );
-    } else {
-        println!("achieved:         {achieved:.1} req/s");
-    }
-    println!(
-        "send lag:         max {:.2}ms (scheduler falling behind)",
-        max_lag_us as f64 / 1000.0
-    );
-    print_latency("latency all ", &all_lat);
-    print_latency("latency GET ", &read_lat);
-    print_latency("latency POST", &write_lat);
-
-    let (checked_writes, verified_writes, failed_writes) = post_verify(cfg, &writes_all).await;
-    println!(
-        "post-run verify:  {verified_writes}/{checked_writes} writes re-checked via GET, {failed_writes} wrong"
-    );
-
-    if !samples.is_empty() {
-        println!("samples:          {}", samples[0]);
-        for sample in samples.iter().skip(1).take(4) {
-            println!("                  {sample}");
-        }
-    }
-
-    let rate_ok = match (cfg.mode, target_total) {
-        (Mode::Rate, Some(target)) if target > 0 => achieved >= cfg.rps as f64 * 0.99,
-        _ => true,
-    };
-    let pass = errors == 0 && verify_fail == 0 && failed_writes == 0 && rate_ok;
-    if pass {
-        match cfg.mode {
-            Mode::Rate => println!(
-                "\nRESULT: PASS - sustained {achieved:.1} req/s for {:.1}s with 0 errors, 0 mismatches",
-                elapsed.as_secs_f64()
-            ),
-            Mode::Saturate => {
-                println!("\nRESULT: PASS - peak {achieved:.1} req/s with 0 errors, 0 mismatches")
-            }
-        }
-    } else {
-        println!("\nRESULT: FAIL");
-    }
-    std::process::exit(if pass { 0 } else { 1 });
-}
-
-async fn post_verify(cfg: &Config, writes: &[(String, String)]) -> (usize, usize, usize) {
-    if writes.is_empty() {
-        return (0, 0, 0);
-    }
-    let step = (writes.len() / 200).max(1);
-    let sample: Vec<&(String, String)> = writes.iter().step_by(step).take(200).collect();
-
-    let mut conn = match Conn::connect(&cfg.host, cfg.port).await {
-        Ok(conn) => conn,
-        Err(_) => return (sample.len(), 0, sample.len()),
-    };
-    let mut ok = 0usize;
-    let mut bad = 0usize;
-    for (code, expected) in &sample {
-        let path = format!("/{code}");
-        let outcome = tokio::time::timeout(cfg.timeout, conn.get(&path)).await;
-        match outcome {
-            Ok(Ok(resp))
-                if resp.status == 302 && resp.location.as_deref() == Some(expected.as_str()) =>
-            {
-                ok += 1;
-            }
-            Ok(Ok(resp)) => {
-                bad += 1;
-                eprintln!(
-                    "loadgen: verify failed for `{code}`: status {} location {:?}",
-                    resp.status, resp.location
-                );
-            }
-            other => {
-                bad += 1;
-                let reason = match other {
-                    Err(_) => "timeout",
-                    Ok(Err(_)) => "transport/parse error",
-                    Ok(Ok(_)) => "unexpected response",
-                };
-                eprintln!("loadgen: verify failed for `{code}`: {reason}");
-                match Conn::connect(&cfg.host, cfg.port).await {
-                    Ok(new_conn) => conn = new_conn,
-                    Err(_) => return (sample.len(), ok, bad),
-                }
-            }
-        }
-    }
-    (sample.len(), ok, bad)
-}
-
-fn print_latency(label: &str, lat: &[u32]) {
-    if lat.is_empty() {
-        println!("{label}       (no samples)");
-        return;
-    }
-    println!(
-        "{label}       p50 {:.2}ms  p90 {:.2}ms  p99 {:.2}ms  p999 {:.2}ms  max {:.2}ms  (n={})",
-        pct(lat, 0.50) as f64 / 1000.0,
-        pct(lat, 0.90) as f64 / 1000.0,
-        pct(lat, 0.99) as f64 / 1000.0,
-        pct(lat, 0.999) as f64 / 1000.0,
-        lat[lat.len() - 1] as f64 / 1000.0,
-        lat.len()
-    );
-}
-
-fn pct(sorted: &[u32], p: f64) -> u32 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
-    sorted[idx]
-}
-
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
-    let cfg = parse_args();
-    let started = Instant::now();
-    let seeds = Arc::new(seed_pool(&cfg).await);
-    eprintln!(
-        "loadgen: seeded {} urls in {:.2}s, starting {} mode",
-        seeds.len(),
-        started.elapsed().as_secs_f64(),
-        match cfg.mode {
-            Mode::Rate => "rate",
-            Mode::Saturate => "saturate",
-        }
-    );
-    match cfg.mode {
-        Mode::Rate => run_rate(&cfg, seeds).await,
-        Mode::Saturate => run_saturate(&cfg, seeds).await,
     }
 }
