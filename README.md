@@ -11,7 +11,7 @@ Minimal Rust URL shortener. Raw HTTP/1.1 on tokio. No web framework.
 - Limits: 1024 conns, 32 concurrent writes, 5s timeouts, 8KB body, 16KB head, 1M URLs default.
 - Prod server ≈900 lines (`src/lib.rs` + `src/store.rs` + `src/bin/shortener.rs`). Loadgen is a separate bench binary.
 
-Live demo: [whiteye.in/telemetry](https://whiteye.in/telemetry) — real-time RPS, redirects/s and fails/s from the public instance, plus a form that shortens URLs into `whiteye.in/s/…` links.
+Live demo: [whiteye.in/telemetry](https://whiteye.in/telemetry) — traffic charts with 1/2/5-minute windows, response counters, host resources, pause/resume and CSV export, plus a form that shortens URLs into `whiteye.in/s/…` links.
 
 ```
 $ cargo run --release --bin shortener -- --ephemeral &
@@ -26,7 +26,7 @@ location: https://example.com/hello
 ## Self-run (60s)
 
 ```console
-$ cargo test --release --locked          # 22 Rust tests
+$ cargo test --release --locked          # 26 Rust tests
 $ python3 tests/blackbox.py              # 10 fail-closed + SIGKILL tests
 $ ./bench.sh --repeats 1 --seconds 10    # quick full loop, ~60s, writes target/benchmarks/<stamp>/
 $ cat target/benchmarks/*/CLAIMS.md      # machine-stamped numbers, quote included
@@ -57,6 +57,7 @@ Endpoints:
 | `HEAD` | `/{code}`, `/health` | same headers, no body |
 | `GET` | `/health`, `/ready` | 200 `ok` (public) |
 | `GET` | `/api/stats` + auth | 200 `urls`/`shards`/`capacity` |
+| `GET` | `/api/host` | 200 host facts (public, CORS-open): CPU, memory, OS and load averages. |
 | `GET` | `/api/metrics` | 200 counters (public, CORS-open): `uptime_s`, `requests`, `redirects`, `writes`, `errors_4xx`, `errors_5xx`, `urls`, `capacity`. Sample it to derive RPS. |
 
 \*Auth required when `RUSHORT_API_KEY` is set (always required for durable mode + non-loopback binds). Ephemeral loopback bench omits it.
@@ -86,6 +87,14 @@ Read before quoting:
 - No NIC/TLS. Linux + io_uring / kernel bypass needed for 1M+ real RPS.
 - Durable test is a rate check (1,158 RPS = 100M/day avg), not a 24h soak.
 - 100M test runs on a fresh server; suite order matters for thermal throttling.
+
+## VPS follow-up (September 2026)
+
+A controlled comparison on the four-vCPU `rove` host measured the unchanged implementation at **951k RPS with pipeline depth 128** (median of three 8-second runs, p99 batch latency 48.2–48.6ms) and **32.8k RPS without pipelining**. Client and server shared the host, pinned to separate CPU pairs; all runs had zero drops, transport errors, or redirect mismatches. These measurements are not comparable to the M4 Pro results above or public HTTPS capacity.
+
+Batching metrics updates and reducing redirect-cache contention did not establish a consistent improvement, so neither experiment was deployed. See the [method and results](docs/performance-2026-09-14.md) and [raw measurements](docs/benchmarks/rove-2026-09-14.json).
+
+The live demo includes a continuous synthetic load generator. Dashboard traffic is not organic visitor traffic; chart history is collected only while the browser is open. The public website redirect path also adds an upstream network request, so user-visible latency needs separate measurement from Rust throughput.
 
 ## Loadgen
 

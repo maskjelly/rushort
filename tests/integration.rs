@@ -439,3 +439,34 @@ async fn host_endpoint_reports_facts() {
         "got: {body}"
     );
 }
+
+#[tokio::test]
+async fn pipelined_metrics_include_prior_requests_and_flush_on_close() {
+    let addr = start_server().await;
+    let health = format!("GET /health HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+    let snapshot = format!("GET /api/metrics HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+    let request = format!(
+        "{}{}{}{}",
+        health.repeat(300),
+        snapshot,
+        health,
+        get_request(addr, "/missing")
+    );
+    let response = roundtrip(addr, &request).await;
+    assert!(response.contains("\"requests\":300,"), "{response}");
+    assert_eq!(response.matches("HTTP/1.1 200 OK").count(), 302);
+    let response = roundtrip(addr, &get_request(addr, "/api/metrics")).await;
+    assert!(response.contains("\"requests\":303,"), "{response}");
+    assert!(response.contains("\"errors_4xx\":1,"), "{response}");
+}
+
+#[tokio::test]
+async fn metrics_publish_valid_pipeline_before_malformed_request() {
+    let addr = start_server().await;
+    let request = format!("GET /health HTTP/1.1\r\nHost: {addr}\r\n\r\nGET /bad HTTP/1.1\r\n\r\n");
+    let response = roundtrip(addr, &request).await;
+    assert!(response.contains("HTTP/1.1 400"));
+    let response = roundtrip(addr, &get_request(addr, "/api/metrics")).await;
+    assert!(response.contains("\"requests\":2,"), "{response}");
+    assert!(response.contains("\"errors_4xx\":1,"), "{response}");
+}
