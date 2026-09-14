@@ -422,5 +422,8 @@ async fn metrics_counts_requests_redirects_and_errors() {
     assert!(body.contains("\"writes\":1"), "got: {body}");
     assert!(body.contains("\"errors_4xx\":1"), "got: {body}");
     assert!(body.contains("\"urls\":1"), "got: {body}");
-    assert!(body.contains("access-control-allow-origin: *"), "got: {body}");
+    assert!(
+        body.contains("access-control-allow-origin: *"),
+        "got: {body}"
+    );
 }

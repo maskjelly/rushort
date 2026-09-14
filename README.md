@@ -9,7 +9,9 @@ Minimal Rust URL shortener. Raw HTTP/1.1 on tokio. No web framework.
 - SQLite WAL (FULL + fullfsync) + RAM read cache. Kill-safe. Restart keeps data.
 - Auth writes with `RUSHORT_API_KEY` (≥32 chars). Reads public.
 - Limits: 1024 conns, 32 concurrent writes, 5s timeouts, 8KB body, 16KB head, 1M URLs default.
-- Prod server ≈800 lines (`src/lib.rs` + `src/store.rs` + `src/bin/shortener.rs`). Loadgen is a separate bench binary.
+- Prod server ≈900 lines (`src/lib.rs` + `src/store.rs` + `src/bin/shortener.rs`). Loadgen is a separate bench binary.
+
+Live demo: [whiteye.in/telemetry](https://whiteye.in/telemetry) — real-time RPS, redirects/s and fails/s from the public instance, plus a form that shortens URLs into `whiteye.in/s/…` links.
 
 ```
 $ cargo run --release --bin shortener -- --ephemeral &
@@ -55,6 +57,7 @@ Endpoints:
 | `HEAD` | `/{code}`, `/health` | same headers, no body |
 | `GET` | `/health`, `/ready` | 200 `ok` (public) |
 | `GET` | `/api/stats` + auth | 200 `urls`/`shards`/`capacity` |
+| `GET` | `/api/metrics` | 200 counters (public, CORS-open): `uptime_s`, `requests`, `redirects`, `writes`, `errors_4xx`, `errors_5xx`, `urls`, `capacity`. Sample it to derive RPS. |
 
 \*Auth required when `RUSHORT_API_KEY` is set (always required for durable mode + non-loopback binds). Ephemeral loopback bench omits it.
 
@@ -117,6 +120,16 @@ Single writer. Caddy (TLS) → 127.0.0.1:8080 → local SQLite. See [`deploy/REA
 - Set `RUSHORT_API_KEY` + `RUSHORT_PUBLIC_BASE`. Keep 8080 private.
 - Backup via SQLite `.backup`, not file copy. No replication / multiserver.
 - Codes are sequential IDs (base62), not secrets. Trusted creators only; anonymous shortening needs abuse controls.
+
+Behind a path prefix (e.g. serving the demo under `/rushort/`), strip it at the proxy — the app only speaks origin-form paths:
+
+```caddy
+handle_path /rushort/* {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+Note: `short_url` in POST responses is built from `--public-base`, which must be a bare origin. Under a path prefix, build public links from the returned `code` instead.
 
 ## Contributing
 

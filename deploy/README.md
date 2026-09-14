@@ -4,10 +4,12 @@ Supported topology: HTTPS client → Caddy → loopback HTTP/1.1 shortener → l
 
 1. Build with `cargo build --release --locked`; install `target/release/shortener` as `/usr/local/bin/shortener` on the same OS/architecture.
 2. Install `rushort.service` in `/etc/systemd/system/`. Create `/etc/rushort.env` readable only by root, with `RUSHORT_API_KEY` (a random key of at least 32 characters) and `RUSHORT_PUBLIC_BASE=https://s.your-domain.example`. The unit uses a private state directory and listens on loopback.
-3. Install Caddy and set `RUSHORT_DOMAIN` in **Caddy's** environment. Use the supplied Caddyfile and run `caddy validate --config /etc/caddy/Caddyfile` before reloading. Allow incoming 80/443, keep 8080 private. Configure DNS for the domain.
+3. Install Caddy and set `RUSHORT_DOMAIN` in **Caddy's** environment. Use the supplied Caddyfile and run `caddy validate --config /etc/caddy/Caddyfile` before reloading. Allow incoming 80/443, keep 8080 private. Configure DNS for the domain. To serve under a path prefix instead of a dedicated domain, strip it at the proxy (`handle_path /rushort/* { reverse_proxy 127.0.0.1:8080 }`) and build public links from response `code` fields, since `--public-base` must be a bare origin.
 4. Start the service with systemd. Verify a keyed POST, GET and HEAD redirect through the actual HTTPS domain. Restart it and verify the same code again before admitting users.
 
 Write and stats requests use `Authorization: Bearer <RUSHORT_API_KEY>`. Keep this credential server-side. Redirects are public; sequential short codes are identifiers, not access-control secrets. This service is intended for trusted link creators. Anonymous shortening requires a separate abuse-control policy.
+
+`GET /api/metrics` is intentionally public and CORS-open (`Access-Control-Allow-Origin: *`) so dashboards can poll it cross-origin. It exposes only counters — never URLs. Sample it once a second and difference the cumulative fields to derive RPS, redirects/s and fails/s.
 
 The backend accepts Content-Length bodies up to 8 KiB and rejects Transfer-Encoding, duplicate Content-Length and malformed HTTP. Use clients that send a length for POST bodies. Caddy handles public TLS and HTTP/2/3; the application protocol is deliberately restricted to HTTP/1.x origin-form requests. Reverse-proxy retry of POST is disabled by default: a client timeout can occur after commit, and retrying can create another code.
 
