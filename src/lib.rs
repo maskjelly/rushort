@@ -149,8 +149,8 @@ pub fn host_snapshot() -> String {
     }
     fn field(text: &str, key: &str) -> Option<String> {
         text.lines().find_map(|l| {
-            let (k, v) = l.split_once(':')?;
-            (k.trim() == key).then(|| v.trim().to_owned())
+            let (k, v) = l.split_once([':', '='])?;
+            (k.trim() == key).then(|| v.trim().trim_matches('"').to_owned())
         })
     }
     let empty = String::new();
