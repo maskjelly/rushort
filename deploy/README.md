@@ -28,3 +28,13 @@ SQLite uses WAL, synchronous=FULL and fullfsync=ON. Acknowledgment follows commi
 Caddy and systemd templates require validation on the deployment host. Local macOS testing does not establish public HTTPS throughput, Linux service configuration or power-loss durability. Process-kill recovery is covered by the automated test; a power-loss test and long production soak have not been performed.
 
 References: [Caddy reverse proxy](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy), [Caddy request limits](https://caddyserver.com/docs/caddyfile/directives/request_body), [SQLite durability settings](https://www.sqlite.org/pragma.html#pragma_synchronous).
+
+## Install a verified release
+
+After building and testing a Linux binary, install it on the deployment host:
+
+```sh
+sudo python3 deploy/install-release.py target/release/shortener
+```
+
+The installer backs up the current binary and uses SQLite's online backup API, checks backup integrity, atomically replaces the binary, restarts the service and checks health. Failed startup restores the previous binary. Backups are private under `/var/backups/rushort/<timestamp>`; move database backups off-host and enforce retention separately. Flags select nondefault database, target binary, service and health URL. It does not migrate or automatically restore the live database. To verify a backup, run an isolated shortener with `--db <backup>/urls.db` on another loopback port and check known redirects; use a copied backup if running as an unprivileged account.
