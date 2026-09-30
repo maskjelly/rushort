@@ -98,6 +98,8 @@ Batching metrics updates and reducing redirect-cache contention did not establis
 
 The live demo includes a continuous synthetic load generator. Dashboard traffic is not organic visitor traffic; chart history is collected only while the browser is open. The public website redirect path also adds an upstream network request, so user-visible latency needs separate measurement from Rust throughput.
 
+[September 30 comparison](docs/performance-2026-09-30.md): 18 verified runs rejected another redirect optimization. Monitoring now uses a one-second host cache and exposes monotonic `uptime_ms`.
+
 ## Loadgen
 
 - `--mode rate`: exact `rps×duration` on absolute deadlines. Needs ≥99%, 0 errors/drops.

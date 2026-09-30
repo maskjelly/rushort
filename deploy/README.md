@@ -9,7 +9,7 @@ Supported topology: HTTPS client → Caddy → loopback HTTP/1.1 shortener → l
 
 Write and stats requests use `Authorization: Bearer <RUSHORT_API_KEY>`. Keep this credential server-side. Redirects are public; sequential short codes are identifiers, not access-control secrets. This service is intended for trusted link creators. Anonymous shortening requires a separate abuse-control policy.
 
-`GET /api/metrics` is intentionally public and CORS-open (`Access-Control-Allow-Origin: *`) so dashboards can poll it cross-origin. It exposes only counters — never URLs. Sample it once a second and difference the cumulative fields to derive RPS, redirects/s and fails/s.
+`GET /api/metrics` is intentionally public and CORS-open (`Access-Control-Allow-Origin: *`) so dashboards can poll it cross-origin. It exposes only counters — never URLs. Sample it once a second and difference the cumulative fields to derive RPS, redirects/s and fails/s. Divide by the change in `uptime_ms` (milliseconds), and reset your sampling baseline when uptime or counters decrease. `/api/host` is cached for one second; it is an approximate host snapshot.
 
 The backend accepts Content-Length bodies up to 8 KiB and rejects Transfer-Encoding, duplicate Content-Length and malformed HTTP. Use clients that send a length for POST bodies. Caddy handles public TLS and HTTP/2/3; the application protocol is deliberately restricted to HTTP/1.x origin-form requests. Reverse-proxy retry of POST is disabled by default: a client timeout can occur after commit, and retrying can create another code.
 

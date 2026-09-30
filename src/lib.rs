@@ -85,6 +85,7 @@ pub struct Metrics {
     errors_5xx: AtomicU64,
     started: std::time::Instant,
     started_unix: u64,
+    host_cache: tokio::sync::Mutex<Option<(std::time::Instant, String)>>,
 }
 impl Default for Metrics {
     fn default() -> Self {
@@ -100,6 +101,7 @@ impl Metrics {
             errors_4xx: AtomicU64::new(0),
             errors_5xx: AtomicU64::new(0),
             started: std::time::Instant::now(),
+            host_cache: tokio::sync::Mutex::new(None),
             started_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -127,7 +129,8 @@ impl Metrics {
     pub fn snapshot(&self, store: &Store) -> String {
         let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
         format!(
-            "{{\"uptime_s\":{},\"started_unix\":{},\"requests\":{},\"redirects\":{},\"writes\":{},\"errors_4xx\":{},\"errors_5xx\":{},\"urls\":{},\"capacity\":{}}}",
+            "{{\"uptime_ms\":{},\"uptime_s\":{},\"started_unix\":{},\"requests\":{},\"redirects\":{},\"writes\":{},\"errors_4xx\":{},\"errors_5xx\":{},\"urls\":{},\"capacity\":{}}}",
+            self.started.elapsed().as_millis(),
             self.started.elapsed().as_secs(),
             self.started_unix,
             load(&self.requests),
@@ -386,7 +389,17 @@ async fn route(
         }
         ("GET", "/api/host") => {
             // Public and CORS-open: host facts for the dashboard device panel.
-            let snapshot = host_snapshot();
+            let mut cache = config.metrics.host_cache.lock().await;
+            if cache
+                .as_ref()
+                .is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(1))
+            {
+                let snapshot = tokio::task::spawn_blocking(host_snapshot)
+                    .await
+                    .unwrap_or_else(|_| "{}".into());
+                *cache = Some((std::time::Instant::now(), snapshot));
+            }
+            let snapshot = &cache.as_ref().unwrap().1;
             write!(out, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\ncache-control: no-store\r\naccess-control-allow-origin: *\r\n", snapshot.len()).unwrap();
             connection(out, close);
             out.extend_from_slice(snapshot.as_bytes());

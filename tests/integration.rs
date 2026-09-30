@@ -470,3 +470,17 @@ async fn metrics_publish_valid_pipeline_before_malformed_request() {
     assert!(response.contains("\"requests\":2,"), "{response}");
     assert!(response.contains("\"errors_4xx\":1,"), "{response}");
 }
+
+#[tokio::test]
+async fn metrics_monotonic_time_has_subsecond_resolution() {
+    let addr = start_server().await;
+    let response = roundtrip(addr, &get_request(addr, "/api/metrics")).await;
+    let body: serde_json::Value =
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let response = roundtrip(addr, &get_request(addr, "/api/metrics")).await;
+    let later: serde_json::Value =
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert!(later["uptime_ms"].as_u64().unwrap() > body["uptime_ms"].as_u64().unwrap());
+    assert_eq!(body["started_unix"], later["started_unix"]);
+}
